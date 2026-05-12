@@ -56,7 +56,7 @@ with st.sidebar:
     st.header("筛选条件")
     unit_range = st.slider("台数范围", 1, 20, (1, 8), step=1)
     run_days_range = st.slider("折算运行天数", 0, 365, (300, 320), step=1)
-    payback_range = st.slider("静态回收期（年）", 0.0, 16.0, (4.0, 6.0), step=0.1)
+    payback_range = st.slider("静态回收期（年）", 0.0, 16.0, (2.0, 6.0), step=0.1)
 
     st.header("设备")
     selected_models = st.multiselect("设备型号", ["S1", "S2", "X3"], default=["S1", "S2", "X3"])

@@ -41,6 +41,8 @@ class ModelParams:
     operation_cost_rate: float = 0.01
     tax_rate: float = 0.05
     interest_rate: float = 0.04
+    discharge_price_override: float = 1.0278588881151
+    charge_price_override: float = 0.31275
 
 
 @dataclass
@@ -149,39 +151,6 @@ def load_device_specs(workbook_path: str | Path) -> list[DeviceSpec]:
 
 def load_pivot_from_workbook(workbook_path: str | Path) -> pd.DataFrame:
     wb = load_workbook(workbook_path, data_only=True, read_only=True)
-    if "容量-消纳测算" in wb.sheetnames:
-        ws = wb["容量-消纳测算"]
-    elif len(wb.worksheets) > 1:
-        ws = wb.worksheets[1]
-    else:
-        ws = None
-    if ws is not None:
-        time_cols: list[tuple[int, str]] = []
-        header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
-        for idx, value in enumerate(header[2:], start=2):
-            label = normalize_time(value)
-            if label is None:
-                break
-            time_cols.append((idx, label))
-        rows: list[dict[str, Any]] = []
-        max_col = time_cols[-1][0] + 1 if time_cols else 2
-        time_labels = [label for _, label in time_cols]
-        for values in ws.iter_rows(min_row=2, max_col=max_col, values_only=True):
-            day = normalize_date(values[1] if len(values) > 1 else None)
-            if day is None:
-                continue
-            item: dict[str, Any] = {"日期": day}
-            has_value = False
-            for offset, label in enumerate(time_labels, start=2):
-                val = safe_float(values[offset] if offset < len(values) else 0.0)
-                item[label] = val
-                has_value = has_value or val != 0
-            if has_value:
-                rows.append(item)
-        if rows:
-            df = pd.DataFrame(rows).drop_duplicates(subset=["日期"], keep="last")
-            return df.sort_values("日期").reset_index(drop=True)
-
     ws = wb["负荷-原始数据"] if "负荷-原始数据" in wb.sheetnames else wb.worksheets[0]
     records: list[dict[str, Any]] = []
     for values in ws.iter_rows(min_row=2, values_only=True):
@@ -473,6 +442,234 @@ def weighted_prices(total_row: dict[str, Any]) -> tuple[float, float]:
     return discharge_price, charge_price
 
 
+def _slots_between(times: list[str], start: str, end: str) -> list[str]:
+    return [slot for slot in times if start <= slot <= end]
+
+
+MORNING_FIXED_FLAT = ["09:00:00", "09:15:00", "09:30:00", "09:45:00", "10:00:00", "10:15:00", "10:30:00", "10:45:00"]
+OLD_RULE_1 = ["15:00:00", "15:15:00", "15:30:00", "15:45:00"]
+OLD_RULE_2 = [
+    "16:00:00", "16:15:00", "16:30:00", "16:45:00", "17:00:00", "17:15:00", "17:30:00", "17:45:00",
+    "18:00:00", "18:15:00", "18:30:00", "18:45:00", "19:00:00", "19:15:00", "19:30:00", "19:45:00",
+    "20:00:00", "20:15:00", "20:30:00", "20:45:00", "21:00:00", "21:15:00", "21:30:00", "21:45:00",
+    "22:00:00", "22:15:00", "22:30:00", "22:45:00",
+]
+OLD_RULE_3 = OLD_RULE_2[:16]
+OLD_RULE_4 = ["15:00:00", "15:15:00", "15:30:00", "15:45:00"] + OLD_RULE_3[:12]
+NEW_RULE_1 = OLD_RULE_1
+NEW_RULE_2 = OLD_RULE_3
+NEW_RULE_3 = OLD_RULE_2[16:]
+NEW_RULE_23 = ["23:00:00", "23:15:00", "23:30:00", "23:45:00"]
+DEC_LATE_19 = ["19:00:00", "19:15:00", "19:30:00", "19:45:00"]
+
+
+def build_power_matrix_excel_rules(
+    pivot_df: pd.DataFrame,
+    times: list[str],
+    total_power: float,
+    power_limit: float,
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for _, row in pivot_df.iterrows():
+        day = row["日期"]
+        md = day.strftime("%m-%d")
+        month = day.month
+        item: dict[str, Any] = {"日期": day}
+        for idx, slot in enumerate(times):
+            power = safe_float(row.get(slot))
+            charge_val = max(0.0, min(total_power, power_limit - power))
+            discharge_val = max(0.0, min(total_power, power - total_power * 0.1))
+
+            if slot in DEC_LATE_19 and md >= "12-16":
+                val = discharge_val
+            elif slot in NEW_RULE_23:
+                if ("01-01" <= md <= "06-30") or ("10-01" <= md <= "12-31"):
+                    val = charge_val
+                elif "07-01" <= md <= "09-30":
+                    val = discharge_val
+                else:
+                    val = 0.0
+            elif slot in NEW_RULE_1 and "02-01" <= md <= "12-15":
+                val = charge_val
+            elif slot in NEW_RULE_2 and "09-01" <= md <= "12-15":
+                val = discharge_val
+            elif slot in NEW_RULE_3 and md >= "07-15":
+                val = discharge_val
+            elif slot in OLD_RULE_4 and md >= "12-16":
+                val = discharge_val
+            elif slot in OLD_RULE_3 and "07-15" <= md <= "08-31":
+                val = discharge_val
+            elif slot in OLD_RULE_2 and md <= "07-14":
+                val = discharge_val
+            elif slot in OLD_RULE_1 and md <= "01-31":
+                val = discharge_val
+            elif slot in MORNING_FIXED_FLAT:
+                val = discharge_val
+            elif idx < 24:
+                val = charge_val
+            elif 24 <= idx <= 35:
+                val = charge_val if 7 <= month <= 9 else discharge_val
+            elif 44 <= idx <= 47:
+                val = charge_val if 2 <= month <= 11 else discharge_val
+            elif 48 <= idx <= 59:
+                val = charge_val
+            else:
+                val = 0.0
+            item[slot] = val
+        result.append(item)
+    return result
+
+
+def calc_detailed_stats_excel_rules(
+    new_df: list[dict[str, Any]],
+    times: list[str],
+    total_actual: float,
+    morning_limit_ratio: float,
+    afternoon_limit_ratio: float,
+    afternoon_charge_ratio: float,
+    charge_mode: int,
+    daily_decay: float,
+) -> list[dict[str, Any]]:
+    low1 = _slots_between(times, "00:00:00", "05:45:00")
+    high1 = _slots_between(times, "06:00:00", "07:45:00")
+    flat_1_12 = _slots_between(times, "06:00:00", "11:45:00")
+    flat_2_6_10_11 = _slots_between(times, "08:00:00", "10:45:00")
+    flat_7_9 = _slots_between(times, "09:00:00", "10:45:00")
+    low2_1_12 = _slots_between(times, "12:00:00", "13:45:00")
+    low2_2_6_10_11 = _slots_between(times, "11:00:00", "13:45:00")
+    low2_7_9 = _slots_between(times, "11:00:00", "12:45:00")
+    flat2_1_12 = _slots_between(times, "14:00:00", "14:45:00")
+    flat2_2_6_10_11 = _slots_between(times, "14:00:00", "15:45:00")
+    flat2_7_9 = _slots_between(times, "13:00:00", "15:45:00")
+    peak2_1_dec = _slots_between(times, "19:00:00", "20:45:00")
+    peak2_7_8 = _slots_between(times, "20:00:00", "21:45:00")
+    high2_1_part1 = _slots_between(times, "15:00:00", "18:45:00")
+    high2_1_part2 = _slots_between(times, "21:00:00", "22:45:00")
+    high2_2_714 = _slots_between(times, "16:00:00", "21:45:00")
+    high2_78_part1 = _slots_between(times, "16:00:00", "19:45:00")
+    high2_78_part2 = _slots_between(times, "22:00:00", "23:45:00")
+    high2_9 = _slots_between(times, "16:00:00", "23:45:00")
+    high2_10_11 = _slots_between(times, "16:00:00", "21:45:00")
+    high2_dec_1_15 = _slots_between(times, "15:00:00", "22:45:00")
+
+    daily: list[dict[str, Any]] = []
+    prev_cycle2_remain = 0.0
+    initial_capacity = total_actual
+    for idx, row in enumerate(new_df):
+        day = row["日期"]
+        month = day.month
+        md = day.strftime("%m-%d")
+        cap = max(0.0, initial_capacity - daily_decay * initial_capacity * idx)
+        morning_limit = cap * morning_limit_ratio
+        afternoon_limit = cap * afternoon_limit_ratio
+
+        theo_low1 = min(sum_power(row, low1) / 4, cap)
+        theo_flat_charge1 = 0.0
+        theo_peak1 = 0.0
+        theo_high1 = min(sum_power(row, high1) / 4, cap) if (("02-01" <= md <= "06-30") or ("10-01" <= md <= "11-30")) else 0.0
+        if ("01-01" <= md <= "01-31") or ("12-01" <= md <= "12-31"):
+            flat1_cols = flat_1_12
+        elif ("02-01" <= md <= "06-30") or ("10-01" <= md <= "11-30"):
+            flat1_cols = flat_2_6_10_11
+        elif "07-01" <= md <= "09-30":
+            flat1_cols = flat_7_9
+        else:
+            flat1_cols = []
+        theo_flat_discharge1 = min(sum_power(row, flat1_cols) / 4, cap) if flat1_cols else 0.0
+
+        if ("01-01" <= md <= "01-31") or ("12-01" <= md <= "12-31"):
+            low2_cols = low2_1_12
+            flat2_cols = flat2_1_12
+        elif ("02-01" <= md <= "06-30") or ("10-01" <= md <= "11-30"):
+            low2_cols = low2_2_6_10_11
+            flat2_cols = flat2_2_6_10_11
+        elif "07-01" <= md <= "09-30":
+            low2_cols = low2_7_9
+            flat2_cols = flat2_7_9
+        else:
+            low2_cols = []
+            flat2_cols = []
+        theo_low2 = min(sum_power(row, low2_cols) / 4, cap) if low2_cols else 0.0
+        theo_flat_charge2 = min((sum_power(row, flat2_cols) / 4) * afternoon_charge_ratio, cap) if flat2_cols else 0.0
+
+        if "01-01" <= md <= "01-31":
+            theo_peak2 = min(sum_power(row, peak2_1_dec) / 4, cap)
+        elif "02-01" <= md <= "07-14":
+            theo_peak2 = 0.0
+        elif "07-15" <= md <= "08-31":
+            theo_peak2 = min(sum_power(row, peak2_7_8) / 4, cap)
+        elif "09-01" <= md <= "12-15":
+            theo_peak2 = 0.0
+        elif "12-16" <= md <= "12-31":
+            theo_peak2 = min(sum_power(row, peak2_1_dec) / 4, cap)
+        else:
+            theo_peak2 = 0.0
+
+        if "01-01" <= md <= "01-31":
+            theo_high2 = min((sum_power(row, high2_1_part1) + sum_power(row, high2_1_part2)) / 4, cap)
+        elif "02-01" <= md <= "07-14":
+            theo_high2 = min(sum_power(row, high2_2_714) / 4, cap)
+        elif "07-15" <= md <= "08-31":
+            theo_high2 = min((sum_power(row, high2_78_part1) + sum_power(row, high2_78_part2)) / 4, cap)
+        elif "09-01" <= md <= "09-30":
+            theo_high2 = min(sum_power(row, high2_9) / 4, cap)
+        elif "10-01" <= md <= "11-30":
+            theo_high2 = min(sum_power(row, high2_10_11) / 4, cap)
+        elif "12-01" <= md <= "12-15":
+            theo_high2 = min(sum_power(row, high2_dec_1_15) / 4, cap)
+        elif "12-16" <= md <= "12-31":
+            theo_high2 = min((sum_power(row, high2_1_part1) + sum_power(row, high2_1_part2)) / 4, cap)
+        else:
+            theo_high2 = 0.0
+        theo_flat_discharge2 = 0.0
+
+        actual_low1 = min(theo_low1, cap - prev_cycle2_remain) if idx else min(theo_low1, cap)
+        actual_low1 = max(0.0, actual_low1)
+        actual_flat_charge1 = min(theo_flat_charge1, max(0.0, cap - actual_low1 - (prev_cycle2_remain if idx else 0.0)))
+        total_charge1 = actual_low1 + actual_flat_charge1 + (prev_cycle2_remain if idx else 0.0)
+        discharge_limit1 = max(0.0, min(total_charge1, morning_limit))
+        actual_high1 = min(discharge_limit1, theo_high1)
+        remain1 = discharge_limit1 - actual_high1
+        actual_peak1 = min(remain1, theo_peak1)
+        remain1 -= actual_peak1
+        actual_flat_discharge1 = min(remain1, theo_flat_discharge1)
+        cycle1_remain = total_charge1 - actual_high1 - actual_peak1 - actual_flat_discharge1
+
+        actual_low2 = min(theo_low2, max(0.0, cap - cycle1_remain))
+        actual_flat_charge2 = min(theo_flat_charge2, max(0.0, cap - cycle1_remain - actual_low2))
+        total_charge2 = cycle1_remain + actual_low2 + actual_flat_charge2
+        discharge_limit2 = max(0.0, min(total_charge2, afternoon_limit))
+        actual_peak2 = min(discharge_limit2, theo_peak2)
+        remain2 = discharge_limit2 - actual_peak2
+        actual_high2 = min(remain2, theo_high2)
+        remain2 -= actual_high2
+        actual_flat_discharge2 = min(remain2, theo_flat_discharge2)
+        cycle2_remain = total_charge2 - actual_peak2 - actual_high2 - actual_flat_discharge2
+        prev_cycle2_remain = cycle2_remain
+
+        cycle1 = actual_peak1 + actual_high1 + actual_flat_discharge1
+        cycle2 = actual_peak2 + actual_high2 + actual_flat_discharge2
+        total_discharge = cycle1 + cycle2
+        daily.append(
+            {
+                "日期": day,
+                "月份": month,
+                "折算天数": total_discharge / cap / 2 if charge_mode == 2 and cap else total_discharge / cap if cap else 0.0,
+                "满容量天数": total_discharge / initial_capacity / 2 if initial_capacity else 0.0,
+                "低谷充电": actual_low1 + actual_low2,
+                "平段充电": actual_flat_charge1 + actual_flat_charge2,
+                "尖峰放电": actual_peak1 + actual_peak2,
+                "高峰放电": actual_high1 + actual_high2,
+                "平段放电": actual_flat_discharge1 + actual_flat_discharge2,
+                "总放电": total_discharge,
+                "理论总可充电量": min(theo_low1 + theo_flat_charge1 + theo_low2 + theo_flat_charge2, cap * 2),
+                "理论总可放电量": min(theo_peak1 + theo_high1 + theo_flat_discharge1 + theo_peak2 + theo_high2 + theo_flat_discharge2, cap * 2),
+                "充电容量": cap,
+            }
+        )
+    return daily
+
+
 def payback_summary(
     run_days: float,
     discharge_tax: float,
@@ -591,8 +788,8 @@ def evaluate_config(pivot_df: pd.DataFrame, spec: DeviceSpec, unit_count: int, p
     total_actual = spec.actual_kwh * unit_count
     power_limit = params.safety_factor * params.transformer_capacity_kva
     daily_decay = params.annual_decay_rate / 365
-    power_matrix = build_power_matrix(pivot_df, times, total_power, power_limit, params.afternoon_charge_ratio)
-    daily = calc_detailed_stats(
+    power_matrix = build_power_matrix_excel_rules(pivot_df, times, total_power, power_limit)
+    daily = calc_detailed_stats_excel_rules(
         power_matrix,
         times,
         total_actual,
@@ -605,7 +802,8 @@ def evaluate_config(pivot_df: pd.DataFrame, spec: DeviceSpec, unit_count: int, p
     monthly = aggregate_monthly(daily)
     monthly_df = pd.DataFrame(monthly)
     total_row = monthly[-1]
-    discharge_price, charge_price = weighted_prices(total_row)
+    discharge_price = params.discharge_price_override if params.discharge_price_override > 0 else weighted_prices(total_row)[0]
+    charge_price = params.charge_price_override if params.charge_price_override > 0 else weighted_prices(total_row)[1]
     run_days = safe_float(total_row.get("折算天数"))
     payback = payback_summary(
         run_days,
