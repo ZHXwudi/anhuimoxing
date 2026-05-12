@@ -1,0 +1,706 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict
+from datetime import date, datetime, time
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+from openpyxl import load_workbook
+
+
+PRICE_PEAK = 1.3252
+PRICE_HIGH = 1.0915
+PRICE_FLAT = 0.6499
+PRICE_LOW = 0.3128
+
+
+@dataclass(frozen=True)
+class DeviceSpec:
+    model: str
+    mode: int
+    power_kw: float
+    rated_kwh: float
+    actual_kwh: float
+    device_cost_wan: float
+    construction_cost_wan: float
+    remark: str = ""
+
+
+@dataclass(frozen=True)
+class ModelParams:
+    safety_factor: float = 0.85
+    transformer_capacity_kva: float = 12550.0
+    discount_rate: float = 0.8
+    brokerage_rate: float = 0.13
+    morning_limit_ratio: float = 1.0
+    afternoon_limit_ratio: float = 1.0
+    afternoon_charge_ratio: float = 0.0
+    annual_decay_rate: float = 0.025
+    system_efficiency_payback: float = 0.865
+    operation_cost_rate: float = 0.01
+    tax_rate: float = 0.05
+    interest_rate: float = 0.04
+
+
+@dataclass
+class ConfigResult:
+    rank: int
+    model: str
+    mode: int
+    unit_count: int
+    system_power_kw: float
+    rated_kwh: float
+    actual_kwh: float
+    run_days: float
+    payback_years: float | None
+    total_discharge_kwh: float
+    total_charge_kwh: float
+    discharge_price: float
+    charge_price: float
+    price_spread: float
+    first_year_income_wan: float
+    initial_invest_wan: float
+    final_cash_flow_wan: float
+    balance_text: str
+    score: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def normalize_time(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, time):
+        return value.strftime("%H:%M:%S")
+    text = str(value).strip().replace("\t", "")
+    if not text:
+        return None
+    for fmt in ("%H:%M:%S", "%H:%M", "%H:%M:%S.%f"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%H:%M:%S")
+        except ValueError:
+            pass
+    return None
+
+
+def normalize_date(value: Any) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def parse_minutes(value: str) -> int:
+    h, m, s = (int(part) for part in value.split(":"))
+    return h * 60 + m + s // 60
+
+
+def time_in_range(value: str, start: str, end: str) -> bool:
+    minute = parse_minutes(value)
+    return parse_minutes(start) <= minute <= parse_minutes(end)
+
+
+def load_device_specs(workbook_path: str | Path) -> list[DeviceSpec]:
+    wb = load_workbook(workbook_path, data_only=True, read_only=True)
+    ws = wb["设备规格"] if "设备规格" in wb.sheetnames else wb.worksheets[7]
+    specs: list[DeviceSpec] = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or not row[0]:
+            continue
+        mode = safe_float(row[1], -1)
+        if mode not in (1, 2):
+            continue
+        specs.append(
+            DeviceSpec(
+                model=str(row[0]).strip(),
+                mode=int(mode),
+                power_kw=safe_float(row[2]),
+                rated_kwh=safe_float(row[3]),
+                actual_kwh=safe_float(row[4]),
+                device_cost_wan=safe_float(row[5]),
+                construction_cost_wan=safe_float(row[6]),
+                remark=str(row[7] or ""),
+            )
+        )
+    return specs
+
+
+def load_pivot_from_workbook(workbook_path: str | Path) -> pd.DataFrame:
+    wb = load_workbook(workbook_path, data_only=True, read_only=True)
+    if "容量-消纳测算" in wb.sheetnames:
+        ws = wb["容量-消纳测算"]
+    elif len(wb.worksheets) > 1:
+        ws = wb.worksheets[1]
+    else:
+        ws = None
+    if ws is not None:
+        time_cols: list[tuple[int, str]] = []
+        header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+        for idx, value in enumerate(header[2:], start=2):
+            label = normalize_time(value)
+            if label is None:
+                break
+            time_cols.append((idx, label))
+        rows: list[dict[str, Any]] = []
+        max_col = time_cols[-1][0] + 1 if time_cols else 2
+        time_labels = [label for _, label in time_cols]
+        for values in ws.iter_rows(min_row=2, max_col=max_col, values_only=True):
+            day = normalize_date(values[1] if len(values) > 1 else None)
+            if day is None:
+                continue
+            item: dict[str, Any] = {"日期": day}
+            has_value = False
+            for offset, label in enumerate(time_labels, start=2):
+                val = safe_float(values[offset] if offset < len(values) else 0.0)
+                item[label] = val
+                has_value = has_value or val != 0
+            if has_value:
+                rows.append(item)
+        if rows:
+            df = pd.DataFrame(rows).drop_duplicates(subset=["日期"], keep="last")
+            return df.sort_values("日期").reset_index(drop=True)
+
+    ws = wb["负荷-原始数据"] if "负荷-原始数据" in wb.sheetnames else wb.worksheets[0]
+    records: list[dict[str, Any]] = []
+    for values in ws.iter_rows(min_row=2, values_only=True):
+        day = normalize_date(values[1] if len(values) > 1 else None)
+        slot = normalize_time(values[2] if len(values) > 2 else None)
+        if day is None or slot is None:
+            continue
+        records.append({"日期": day, "时间": slot, "瞬时有功": safe_float(values[3])})
+    raw = pd.DataFrame(records)
+    if raw.empty:
+        raise ValueError("工作簿里没有读取到有效负荷数据")
+    return (
+        raw.pivot_table(index="日期", columns="时间", values="瞬时有功", aggfunc="sum", fill_value=0.0)
+        .reset_index()
+        .sort_values("日期")
+    )
+
+
+def load_uploaded_pivot(file: Any) -> pd.DataFrame:
+    name = getattr(file, "name", "")
+    if name.lower().endswith((".xlsx", ".xlsm")):
+        return load_pivot_from_workbook(file)
+    raw = pd.read_csv(file)
+    date_col = next((c for c in raw.columns if str(c).strip().lower() in ("日期", "date", "day")), raw.columns[0])
+    time_col = next((c for c in raw.columns if str(c).strip().lower() in ("时间", "time", "时刻")), raw.columns[1])
+    power_col = next(
+        (c for c in raw.columns if str(c).strip().lower() in ("瞬时有功", "有功", "power", "load", "有功功率")),
+        raw.columns[2],
+    )
+    raw = raw[[date_col, time_col, power_col]].copy()
+    raw.columns = ["日期", "时间", "瞬时有功"]
+    raw["日期"] = pd.to_datetime(raw["日期"]).dt.date
+    raw["时间"] = raw["时间"].map(normalize_time)
+    raw["瞬时有功"] = pd.to_numeric(raw["瞬时有功"], errors="coerce").fillna(0.0)
+    return (
+        raw.dropna(subset=["时间"])
+        .pivot_table(index="日期", columns="时间", values="瞬时有功", aggfunc="sum", fill_value=0.0)
+        .reset_index()
+        .sort_values("日期")
+    )
+
+
+def build_power_matrix(
+    pivot_df: pd.DataFrame,
+    times: list[str],
+    total_power: float,
+    power_limit: float,
+    afternoon_charge_ratio: float,
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for _, row in pivot_df.iterrows():
+        day = row["日期"]
+        md = day.strftime("%m-%d")
+        is_peak_date = ("01-01" <= md <= "01-31") or ("07-01" <= md <= "08-31")
+        item: dict[str, Any] = {"日期": day}
+        for slot in times:
+            power = safe_float(row.get(slot))
+            charge_val = max(0.0, min(total_power, power_limit - power))
+            discharge_val = max(0.0, min(total_power, power - total_power * 0.1))
+            if time_in_range(slot, "00:00:00", "06:45:00"):
+                val = charge_val
+            elif time_in_range(slot, "07:00:00", "10:45:00"):
+                val = discharge_val
+            elif time_in_range(slot, "11:00:00", "13:45:00"):
+                val = charge_val
+            elif time_in_range(slot, "14:00:00", "15:45:00"):
+                val = min(charge_val, total_power * afternoon_charge_ratio)
+            elif time_in_range(slot, "16:00:00", "17:45:00"):
+                val = discharge_val if is_peak_date else discharge_val
+            elif time_in_range(slot, "18:00:00", "22:45:00"):
+                val = discharge_val
+            elif time_in_range(slot, "23:00:00", "23:45:00"):
+                val = charge_val
+            else:
+                val = 0.0
+            item[slot] = val
+        result.append(item)
+    return result
+
+
+def sum_power(row: dict[str, Any], slots: list[str]) -> float:
+    return sum(safe_float(row.get(slot)) for slot in slots)
+
+
+def calc_detailed_stats(
+    new_df: list[dict[str, Any]],
+    times: list[str],
+    total_actual: float,
+    morning_limit_ratio: float,
+    afternoon_limit_ratio: float,
+    afternoon_charge_ratio: float,
+    charge_mode: int,
+    daily_decay: float,
+) -> list[dict[str, Any]]:
+    low1_times = [t for t in times if time_in_range(t, "00:00:00", "06:45:00")]
+    flat1_times = [t for t in times if time_in_range(t, "07:00:00", "10:45:00")]
+    low2_times = [t for t in times if time_in_range(t, "11:00:00", "13:45:00")]
+    flat2_times = [t for t in times if time_in_range(t, "14:00:00", "15:45:00")]
+    high_short_times = [t for t in times if time_in_range(t, "16:00:00", "17:45:00")]
+    high_extra_times = [t for t in times if time_in_range(t, "22:00:00", "22:45:00")]
+    high_long_times = [t for t in times if time_in_range(t, "16:00:00", "22:45:00")]
+    peak_times = [t for t in times if time_in_range(t, "18:00:00", "21:45:00")]
+
+    daily_list: list[dict[str, Any]] = []
+    prev_cycle2_remain = 0.0
+    initial_capacity = total_actual
+    for idx, row in enumerate(new_df):
+        day = row["日期"]
+        month = day.month
+        md = day.strftime("%m-%d")
+        current_cap = max(0.0, initial_capacity - daily_decay * initial_capacity * idx)
+        morning_limit = current_cap * morning_limit_ratio
+        afternoon_limit = current_cap * afternoon_limit_ratio
+
+        theo_low1 = min(sum_power(row, low1_times) / 4, current_cap)
+        theo_flat_charge1 = 0.0
+        theo_peak1 = 0.0
+        theo_high1 = 0.0
+        theo_flat_discharge1 = min(sum_power(row, flat1_times) / 4, current_cap)
+        theo_low2 = min(sum_power(row, low2_times) / 4, current_cap)
+        theo_flat_charge2 = min((sum_power(row, flat2_times) / 4) * afternoon_charge_ratio, current_cap)
+        if ("01-01" <= md <= "01-31") or ("07-01" <= md <= "08-31") or ("12-01" <= md <= "12-31"):
+            theo_peak2 = min(sum_power(row, peak_times) / 4, current_cap)
+        else:
+            theo_peak2 = 0.0
+        high_sum = sum_power(row, high_short_times) + sum_power(row, high_extra_times) if month in [1, 7, 8, 12] else sum_power(row, high_long_times)
+        theo_high2 = min(high_sum / 4, current_cap)
+
+        actual_low1 = min(theo_low1, current_cap - prev_cycle2_remain) if idx else min(theo_low1, current_cap)
+        actual_low1 = max(0.0, actual_low1)
+        avail_flat_charge1 = max(0.0, current_cap - actual_low1 - (prev_cycle2_remain if idx else 0.0))
+        actual_flat_charge1 = min(theo_flat_charge1, avail_flat_charge1)
+        total_charge1 = actual_low1 + actual_flat_charge1 + (prev_cycle2_remain if idx else 0.0)
+        discharge_limit1 = max(0.0, min(total_charge1, morning_limit))
+        actual_high1 = min(discharge_limit1, theo_high1)
+        remain1 = discharge_limit1 - actual_high1
+        actual_peak1 = min(remain1, theo_peak1)
+        remain1 -= actual_peak1
+        actual_flat_discharge1 = min(remain1, theo_flat_discharge1)
+        total_discharge1 = actual_high1 + actual_peak1 + actual_flat_discharge1
+        cycle1_remain = total_charge1 - total_discharge1
+
+        avail_low2 = max(0.0, current_cap - cycle1_remain)
+        actual_low2 = min(theo_low2, avail_low2)
+        actual_flat_charge2 = min(theo_flat_charge2, max(0.0, avail_low2 - actual_low2))
+        total_charge2 = cycle1_remain + actual_low2 + actual_flat_charge2
+        discharge_limit2 = max(0.0, min(total_charge2, afternoon_limit))
+        actual_peak2 = min(discharge_limit2, theo_peak2)
+        remain2 = discharge_limit2 - actual_peak2
+        actual_high2 = min(remain2, theo_high2)
+        total_discharge2 = actual_peak2 + actual_high2
+        cycle2_remain = total_charge2 - total_discharge2
+        prev_cycle2_remain = cycle2_remain
+
+        cycle1 = actual_peak1 + actual_high1 + actual_flat_discharge1
+        cycle2 = actual_peak2 + actual_high2
+        total_discharge = cycle1 + cycle2
+        eq_days = total_discharge / current_cap / 2 if charge_mode == 2 and current_cap else total_discharge / current_cap if current_cap else 0.0
+        full_days = total_discharge / (initial_capacity * 2) if initial_capacity else 0.0
+        low_charge = actual_low1 + actual_low2
+        flat_charge = actual_flat_charge1 + actual_flat_charge2
+        peak_discharge = actual_peak1 + actual_peak2
+        high_discharge = actual_high1 + actual_high2
+        flat_discharge = actual_flat_discharge1
+
+        daily_list.append(
+            {
+                "日期": day,
+                "月份": month,
+                "折算天数": eq_days,
+                "满容量天数": full_days,
+                "低谷充电": low_charge,
+                "平段充电": flat_charge,
+                "尖峰放电": peak_discharge,
+                "高峰放电": high_discharge,
+                "平段放电": flat_discharge,
+                "总放电": total_discharge,
+                "理论总可充电量": min(theo_low1 + theo_flat_charge1 + theo_low2 + theo_flat_charge2, current_cap * 2),
+                "理论总可放电量": min(theo_peak1 + theo_high1 + theo_flat_discharge1 + theo_peak2 + theo_high2, current_cap * 2),
+                "充电容量": current_cap,
+            }
+        )
+    return daily_list
+
+
+def aggregate_monthly(daily_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    month_days = {1: 31, 2: 28, 3: 31, 4: 30, 5: 31, 6: 30, 7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31}
+    month_type = {1: "特殊", 2: "正常", 3: "正常", 4: "正常", 5: "正常", 6: "正常", 7: "特殊", 8: "特殊", 9: "正常", 10: "正常", 11: "正常", 12: "特殊"}
+    grouped: dict[int, dict[str, float]] = {}
+    for item in daily_list:
+        month = int(item["月份"])
+        dest = grouped.setdefault(
+            month,
+            {
+                "天数": 0.0,
+                "折算天数": 0.0,
+                "谷充电量": 0.0,
+                "平充电量": 0.0,
+                "尖放电量": 0.0,
+                "峰放电量": 0.0,
+                "平放电量": 0.0,
+                "总放电量": 0.0,
+                "总理论可充电": 0.0,
+                "总理论可放电": 0.0,
+                "总充电容量2倍": 0.0,
+            },
+        )
+        dest["天数"] += item["满容量天数"]
+        dest["折算天数"] += item["折算天数"]
+        dest["谷充电量"] += item["低谷充电"]
+        dest["平充电量"] += item["平段充电"]
+        dest["尖放电量"] += item["尖峰放电"]
+        dest["峰放电量"] += item["高峰放电"]
+        dest["平放电量"] += item["平段放电"]
+        dest["总放电量"] += item["总放电"]
+        dest["总理论可充电"] += item["理论总可充电量"]
+        dest["总理论可放电"] += item["理论总可放电量"]
+        dest["总充电容量2倍"] += item["充电容量"] * 2
+
+    rows: list[dict[str, Any]] = []
+    for month in range(1, 13):
+        d = grouped.get(month)
+        if not d:
+            rows.append({"月份": month, "分类": month_type[month], "天数": 0.0, "折算天数": 0.0, "综合充放电文本": "无数据"})
+            continue
+        total_charge = d["谷充电量"] + d["平充电量"]
+        total_discharge = d["总放电量"]
+        ratio_charge = d["总理论可充电"] / d["总充电容量2倍"] if d["总充电容量2倍"] else 0.0
+        ratio_discharge = d["总理论可放电"] / d["总充电容量2倍"] if d["总充电容量2倍"] else 0.0
+        diff = ratio_charge - ratio_discharge
+        text = "消纳不足" if diff >= 0.05 else "充电不足" if diff <= -0.05 else "充放平衡"
+        rows.append(
+            {
+                "月份": month,
+                "分类": month_type[month],
+                "天数": d["天数"],
+                "折算天数": d["折算天数"],
+                "谷充电量(度)": d["谷充电量"],
+                "平充电量(度)": d["平充电量"],
+                "总充电量(度)": total_charge,
+                "尖放电量(度)": d["尖放电量"],
+                "峰放电量(度)": d["峰放电量"],
+                "平放电量(度)": d["平放电量"],
+                "总放电量(度)": total_discharge,
+                "谷充电占比": d["谷充电量"] / total_charge if total_charge else 0.0,
+                "平充电占比": d["平充电量"] / total_charge if total_charge else 0.0,
+                "尖放电占比": d["尖放电量"] / total_discharge if total_discharge else 0.0,
+                "峰放电占比": d["峰放电量"] / total_discharge if total_discharge else 0.0,
+                "平放电占比": d["平放电量"] / total_discharge if total_discharge else 0.0,
+                "每月天数": month_days[month],
+                "理论可充电情况": ratio_charge,
+                "理论可放电情况": ratio_discharge,
+                "综合充放电数值": min(ratio_charge, ratio_discharge),
+                "综合充放电文本": text,
+            }
+        )
+
+    total_keys = ["天数", "折算天数", "谷充电量(度)", "平充电量(度)", "总充电量(度)", "尖放电量(度)", "峰放电量(度)", "平放电量(度)", "总放电量(度)"]
+    total = {key: sum(safe_float(row.get(key)) for row in rows) for key in total_keys}
+    total_charge = total["总充电量(度)"]
+    total_discharge = total["总放电量(度)"]
+    rows.append(
+        {
+            "月份": "总计",
+            "分类": "",
+            **total,
+            "谷充电占比": total["谷充电量(度)"] / total_charge if total_charge else 0.0,
+            "平充电占比": total["平充电量(度)"] / total_charge if total_charge else 0.0,
+            "尖放电占比": total["尖放电量(度)"] / total_discharge if total_discharge else 0.0,
+            "峰放电占比": total["峰放电量(度)"] / total_discharge if total_discharge else 0.0,
+            "平放电占比": total["平放电量(度)"] / total_discharge if total_discharge else 0.0,
+            "每月天数": 365,
+            "理论可充电情况": 0.0,
+            "理论可放电情况": 0.0,
+            "综合充放电数值": 0.0,
+            "综合充放电文本": "",
+        }
+    )
+    return rows
+
+
+def weighted_prices(total_row: dict[str, Any]) -> tuple[float, float]:
+    discharge_price = (
+        PRICE_PEAK * safe_float(total_row.get("尖放电占比"))
+        + PRICE_HIGH * safe_float(total_row.get("峰放电占比"))
+        + PRICE_FLAT * safe_float(total_row.get("平放电占比"))
+    )
+    charge_price = PRICE_LOW * safe_float(total_row.get("谷充电占比")) + PRICE_FLAT * safe_float(total_row.get("平充电占比"))
+    return discharge_price, charge_price
+
+
+def payback_summary(
+    run_days: float,
+    discharge_tax: float,
+    charge_tax: float,
+    total_rated: float,
+    total_actual: float,
+    unit_count: int,
+    device_cost: float,
+    construction_cost: float,
+    params: ModelParams,
+) -> dict[str, Any]:
+    total_device_cost = device_cost * unit_count
+    total_construction_cost = construction_cost * unit_count
+    invest_yr9 = round(0.4 * total_rated / 10 / 1.13, 4)
+    brokerage_yr0 = round(total_rated * params.brokerage_rate / 10, 4)
+    invest_tax_yr1 = total_device_cost + total_construction_cost + brokerage_yr0
+    invest_no_tax_yr1 = total_device_cost / 1.13 + total_construction_cost + brokerage_yr0
+    input_tax = round(invest_tax_yr1 - invest_no_tax_yr1, 4)
+    battery_ratio = [0.0, 0.965, 0.911, 0.877, 0.848, 0.823, 0.800, 0.778, 0.758, 0.965, 0.911, 0.877, 0.848, 0.823, 0.800, 0.778, 0.758]
+
+    power_station_invest = [0.0] * 17
+    power_station_invest[0] = total_device_cost
+    power_station_invest[8] = round(invest_yr9 * 1.13, 4)
+    construction_invest = [0.0] * 17
+    construction_invest[0] = total_construction_cost
+    brokerage = [0.0] * 17
+    brokerage[0] = brokerage_yr0
+
+    charge_kwh = [0.0] * 17
+    discharge_kwh = [0.0] * 17
+    cash_in = [0.0] * 17
+    for n in range(1, 17):
+        charge_kwh[n] = round((run_days * total_actual) * 2 / 10000 / (1 - (1 - params.system_efficiency_payback) / 2) * battery_ratio[n], 2)
+        discharge_kwh[n] = round(params.system_efficiency_payback * charge_kwh[n], 2)
+        cash_in[n] = round((discharge_kwh[n] * discharge_tax - charge_kwh[n] * charge_tax) * params.discount_rate, 2)
+
+    operation_cost = [0.0] * 17
+    insurance_cost = [0.0] * 17
+    output_tax = [0.0] * 17
+    for n in range(1, 17):
+        operation_cost[n] = round(params.operation_cost_rate * 20 * unit_count, 2)
+        insurance_cost[n] = round(invest_no_tax_yr1 * 0.0015, 4)
+        output_tax[n] = round(cash_in[n] - cash_in[n] / 1.13, 4)
+
+    vat_tax = [0.0] * 17
+    vat_tax[0] = -input_tax
+    for n in range(1, 17):
+        vat_tax[n] = output_tax[n]
+    pay_vat = [0.0] * 17
+    for n in range(1, 17):
+        sum_vat = sum(vat_tax[: n + 1])
+        paid_before = sum(pay_vat[:n])
+        if sum_vat > 0 and paid_before == 0:
+            pay_vat[n] = round(sum_vat, 4)
+        elif sum_vat > 0 and paid_before > 0:
+            pay_vat[n] = round(vat_tax[n], 4)
+
+    tax_surcharge = [0.0] * 17
+    depreciation = [0.0] * 17
+    depr_yr1_8 = round(invest_no_tax_yr1 * 0.95 / 8, 4)
+    depr_yr9_16 = round(power_station_invest[8] * 0.95 / (1.13 * 8), 4)
+    for n in range(1, 17):
+        tax_surcharge[n] = round(cash_in[n] * 3 / 10000 + pay_vat[n] * 0.12, 4)
+        depreciation[n] = depr_yr1_8 if n <= 8 else depr_yr9_16
+
+    cash_out = [0.0] * 17
+    net_cash_flow = [0.0] * 17
+    cum_cash_flow = [0.0] * 17
+    interest = [0.0] * 17
+    income_tax = [0.0] * 17
+    project_pre_tax_profit = [0.0] * 17
+    indirect_cum_cash_flow = [0.0] * 17
+
+    cash_out[0] = round(total_device_cost + total_construction_cost + brokerage[0], 4)
+    net_cash_flow[0] = -cash_out[0]
+    cum_cash_flow[0] = net_cash_flow[0]
+    indirect_cum_cash_flow[0] = cum_cash_flow[0]
+
+    for n in range(1, 17):
+        interest[n] = round(abs(cum_cash_flow[n - 1]) * params.interest_rate, 4) if cum_cash_flow[n - 1] < 0 else 0.0
+        taxable_base = cash_in[n] - operation_cost[n] - insurance_cost[n] - tax_surcharge[n] - interest[n] - depreciation[n] - output_tax[n]
+        income_tax[n] = round(taxable_base * params.tax_rate, 4)
+        cash_out[n] = round(power_station_invest[n] + brokerage[n] + operation_cost[n] + insurance_cost[n] + tax_surcharge[n] + interest[n] + income_tax[n] + pay_vat[n], 4)
+        net_cash_flow[n] = round(cash_in[n] - cash_out[n], 4)
+        cum_cash_flow[n] = round(cum_cash_flow[n - 1] + net_cash_flow[n], 4)
+        project_pre_tax_profit[n] = round(taxable_base, 2)
+        indirect_cum_cash_flow[n] = round(depreciation[n] + project_pre_tax_profit[n] + indirect_cum_cash_flow[n - 1] + output_tax[n] - tax_surcharge[n] - max(pay_vat[n], 0.0), 4)
+
+    payback = None
+    for idx, value in enumerate(indirect_cum_cash_flow):
+        if value >= 0:
+            if idx == 0:
+                payback = 0.0
+            else:
+                prev = indirect_cum_cash_flow[idx - 1]
+                denom = value - prev
+                payback = round((idx - 1) + abs(prev) / denom, 2) if denom else float(idx)
+            break
+
+    return {
+        "payback_years": payback,
+        "first_year_income_wan": cash_in[1],
+        "initial_invest_wan": cash_out[0],
+        "final_cash_flow_wan": indirect_cum_cash_flow[-1],
+        "charge_kwh_10k": charge_kwh,
+        "discharge_kwh_10k": discharge_kwh,
+        "cash_in_wan": cash_in,
+        "indirect_cum_cash_flow_wan": indirect_cum_cash_flow,
+    }
+
+
+def evaluate_config(pivot_df: pd.DataFrame, spec: DeviceSpec, unit_count: int, params: ModelParams) -> tuple[ConfigResult, pd.DataFrame, dict[str, Any]]:
+    times = sorted([col for col in pivot_df.columns if col != "日期" and normalize_time(col) is not None], key=parse_minutes)
+    total_power = spec.power_kw * unit_count
+    total_rated = spec.rated_kwh * unit_count
+    total_actual = spec.actual_kwh * unit_count
+    power_limit = params.safety_factor * params.transformer_capacity_kva
+    daily_decay = params.annual_decay_rate / 365
+    power_matrix = build_power_matrix(pivot_df, times, total_power, power_limit, params.afternoon_charge_ratio)
+    daily = calc_detailed_stats(
+        power_matrix,
+        times,
+        total_actual,
+        params.morning_limit_ratio,
+        params.afternoon_limit_ratio,
+        params.afternoon_charge_ratio,
+        spec.mode,
+        daily_decay,
+    )
+    monthly = aggregate_monthly(daily)
+    monthly_df = pd.DataFrame(monthly)
+    total_row = monthly[-1]
+    discharge_price, charge_price = weighted_prices(total_row)
+    run_days = safe_float(total_row.get("折算天数"))
+    payback = payback_summary(
+        run_days,
+        discharge_price,
+        charge_price,
+        total_rated,
+        total_actual,
+        unit_count,
+        spec.device_cost_wan,
+        spec.construction_cost_wan,
+        params,
+    )
+    result = ConfigResult(
+        rank=0,
+        model=spec.model,
+        mode=spec.mode,
+        unit_count=unit_count,
+        system_power_kw=total_power,
+        rated_kwh=total_rated,
+        actual_kwh=total_actual,
+        run_days=run_days,
+        payback_years=payback["payback_years"],
+        total_discharge_kwh=safe_float(total_row.get("总放电量(度)")),
+        total_charge_kwh=safe_float(total_row.get("总充电量(度)")),
+        discharge_price=discharge_price,
+        charge_price=charge_price,
+        price_spread=discharge_price - charge_price,
+        first_year_income_wan=payback["first_year_income_wan"],
+        initial_invest_wan=payback["initial_invest_wan"],
+        final_cash_flow_wan=payback["final_cash_flow_wan"],
+        balance_text=str(total_row.get("综合充放电文本", "")),
+        score=0.0,
+    )
+    return result, monthly_df, payback
+
+
+def find_top_configs(
+    pivot_df: pd.DataFrame,
+    specs: list[DeviceSpec],
+    unit_range: tuple[int, int],
+    run_days_range: tuple[float, float],
+    payback_range: tuple[float, float],
+    params: ModelParams,
+    selected_models: list[str] | None = None,
+    selected_modes: list[int] | None = None,
+    limit: int = 10,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    results: list[ConfigResult] = []
+    detail: dict[str, Any] = {}
+    min_units, max_units = unit_range
+    for spec in specs:
+        if selected_models and spec.model not in selected_models:
+            continue
+        if selected_modes and spec.mode not in selected_modes:
+            continue
+        for units in range(min_units, max_units + 1):
+            result, monthly_df, payback = evaluate_config(pivot_df, spec, units, params)
+            payback_years = result.payback_years
+            if payback_years is None:
+                continue
+            if not (run_days_range[0] <= result.run_days <= run_days_range[1]):
+                continue
+            if not (payback_range[0] <= payback_years <= payback_range[1]):
+                continue
+            result.score = payback_years * 1000 - result.final_cash_flow_wan - result.run_days
+            key = f"{result.model}-{result.mode}-{result.unit_count}"
+            detail[key] = {"monthly": monthly_df, "payback": payback, "result": result}
+            results.append(result)
+    results.sort(key=lambda r: (r.payback_years if r.payback_years is not None else 999, -r.final_cash_flow_wan, -r.run_days))
+    for idx, item in enumerate(results[:limit], start=1):
+        item.rank = idx
+    df = pd.DataFrame([r.to_dict() for r in results[:limit]])
+    if not df.empty:
+        df = df.rename(
+            columns={
+                "rank": "排名",
+                "model": "设备型号",
+                "mode": "充放模式",
+                "unit_count": "台数",
+                "system_power_kw": "系统功率(kW)",
+                "rated_kwh": "额定容量(kWh)",
+                "actual_kwh": "实际容量(kWh)",
+                "run_days": "折算运行天数",
+                "payback_years": "静态回收期(年)",
+                "total_discharge_kwh": "年放电量(kWh)",
+                "total_charge_kwh": "年充电量(kWh)",
+                "discharge_price": "放电均价(元/kWh)",
+                "charge_price": "充电均价(元/kWh)",
+                "price_spread": "价差(元/kWh)",
+                "first_year_income_wan": "首年电费收入(万元)",
+                "initial_invest_wan": "初始投资(万元)",
+                "final_cash_flow_wan": "16年累计现金流(万元)",
+                "balance_text": "充放状态",
+            }
+        )
+        keep = [col for col in df.columns if col != "score"]
+        df = df[keep]
+    return df, detail

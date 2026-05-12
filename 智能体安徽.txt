@@ -1,0 +1,2553 @@
+import csv
+import base64
+import math
+from datetime import datetime
+from collections import defaultdict
+from io import StringIO
+
+# ====================== 辅助函数 ======================
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except:
+        return default
+
+def safe_int(value, default):
+    try:
+        return int(float(value))
+    except:
+        return default
+
+def safe_str(value, default=""):
+    return str(value).strip() if value is not None else default
+
+def parse_time(t):
+    h, m, s = map(int, t.split(':'))
+    return h * 60 + m + s // 60
+
+def time_in_range(t, start, end):
+    return parse_time(start) <= parse_time(t) <= parse_time(end)
+
+def try_parse_date(date_str):
+    date_str = safe_str(date_str)
+    if not date_str:
+        return None
+    formats = [
+        "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d",
+        "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S",
+        "%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y",
+        "%Y%m%d"
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_str, fmt).date()
+        except:
+            continue
+    return None
+
+def try_parse_time(time_str):
+    time_str = safe_str(time_str)
+    if not time_str:
+        return "00:00:00"
+    formats = [
+        "%H:%M:%S", "%H:%M", "%H:%M:%S.%f",
+        "%H时%M分%S秒", "%H时%M分"
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(time_str, fmt).strftime("%H:%M:%S")
+        except:
+            continue
+    return "00:00:00"
+
+def parse_markdown_table(text):
+    rows = []
+    text = safe_str(text)
+    if not text:
+        return rows, "输入为空"
+    lines = text.split("\n")
+    for line in lines:
+        line = line.strip()
+        if not line or all(c in '-|= ' for c in line):
+            continue
+        cols = [safe_str(col).strip() for col in line.split("|")]
+        if cols and cols[0] == "":
+            cols = cols[1:]
+        if cols and cols[-1] == "":
+            cols = cols[:-1]
+        if len(cols) < 4:
+            continue
+        date_str = cols[1]
+        time_str = cols[2]
+        power_str = cols[3]
+        date_obj = try_parse_date(date_str)
+        if not date_obj:
+            continue
+        time_obj = try_parse_time(time_str)
+        power = safe_float(power_str)
+        rows.append({
+            "日期": date_obj,
+            "时间": time_obj,
+            "瞬时有功": power
+        })
+    return rows, f"解析到 {len(rows)} 行有效数据"
+
+def parse_csv_text(csv_text):
+    csv_text = csv_text.strip()
+    if csv_text.startswith('\ufeff'):
+        csv_text = csv_text[1:]
+    try:
+        reader = csv.DictReader(StringIO(csv_text))
+        if not reader.fieldnames:
+            return [], [], {}, "CSV 文件无列名"
+        headers = [h.strip() for h in reader.fieldnames]
+        date_col = None
+        time_col = None
+        power_col = None
+        for h in headers:
+            h_lower = h.lower()
+            if h_lower in ['日期', 'date', '日', 'day']:
+                date_col = h
+            elif h_lower in ['时间', 'time', '时刻']:
+                time_col = h
+            elif h_lower in ['瞬时有功', '有功', 'power', 'load', '有功功率']:
+                power_col = h
+        if date_col is None and len(headers) >= 1:
+            date_col = headers[0]
+        if time_col is None and len(headers) >= 2:
+            time_col = headers[1]
+        if power_col is None and len(headers) >= 3:
+            power_col = headers[2]
+        if date_col is None or time_col is None or power_col is None:
+            return [], [], {}, f"无法确定列，实际列名 {headers}"
+        date_power = defaultdict(dict)
+        all_times = set()
+        for row in reader:
+            date_str = safe_str(row.get(date_col))
+            time_str = safe_str(row.get(time_col))
+            power = safe_float(row.get(power_col))
+            if not date_str or not time_str:
+                continue
+            try:
+                date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            except:
+                continue
+            date_power[date][time_str] = power
+            all_times.add(time_str)
+        dates = sorted(date_power.keys())
+        times = sorted(all_times)
+        return dates, times, date_power, f"成功解析 {len(dates)} 天"
+    except Exception as e:
+        return [], [], {}, f"CSV解析异常: {str(e)}"
+
+def parse_data_text(text):
+    text = safe_str(text)
+    if not text:
+        return [], [], {}, "输入为空"
+    md_rows, md_info = parse_markdown_table(text)
+    if md_rows:
+        date_power = defaultdict(dict)
+        all_times = set()
+        for r in md_rows:
+            date = r["日期"]
+            time_str = r["时间"]
+            power = r["瞬时有功"]
+            date_power[date][time_str] = power
+            all_times.add(time_str)
+        dates = sorted(date_power.keys())
+        times = sorted(all_times)
+        return dates, times, date_power, f"Markdown解析成功: {md_info}"
+    dates, times, date_power, csv_info = parse_csv_text(text)
+    if dates:
+        return dates, times, date_power, f"CSV解析成功: {csv_info}"
+    return [], [], {}, f"无法解析数据，请确保格式为CSV或Markdown表格。Markdown解析信息: {md_info}, CSV解析信息: {csv_info}"
+
+def pivot(dates, times, date_power):
+    pivot = []
+    for date in dates:
+        row = [date]
+        for t in times:
+            row.append(date_power.get(date, {}).get(t, 0.0))
+        pivot.append(row)
+    return pivot, times
+
+def build_power_matrix(pivot, times, total_power, power_limit, afternoon_charge_ratio):
+    low1_times = [t for t in times if time_in_range(t, "00:00:00", "06:45:00")]
+    flat1_times = [t for t in times if time_in_range(t, "07:00:00", "10:45:00")]
+    low2_times = [t for t in times if time_in_range(t, "11:00:00", "13:45:00")]
+    flat2_times = [t for t in times if time_in_range(t, "14:00:00", "15:45:00")]
+    high_short_times = [t for t in times if time_in_range(t, "16:00:00", "17:45:00")]
+    high_extra_times = [t for t in times if time_in_range(t, "22:00:00", "22:45:00")]
+    high_long_times = [t for t in times if time_in_range(t, "16:00:00", "22:45:00")]
+    peak_times = [t for t in times if time_in_range(t, "18:00:00", "21:45:00")]
+    new_df = []
+    formula_map = []
+    for row_idx, row in enumerate(pivot):
+        date = row[0]
+        power_vals = row[1:]
+        charge_row = [max(0, min(total_power, power_limit - p)) for p in power_vals]
+        discharge_row = [max(0, min(total_power, p - total_power * 0.1)) for p in power_vals]
+        month = date.month
+        md = date.strftime("%m-%d")
+        is_peak_date = ("01-01" <= md <= "01-31") or ("07-01" <= md <= "08-31")
+        day_power = {}
+        formula = {}
+        for col_idx, t in enumerate(times):
+            if time_in_range(t, "00:00:00", "06:45:00"):
+                val = charge_row[col_idx]
+                typ = 'charge'
+            elif time_in_range(t, "07:00:00", "10:45:00"):
+                val = discharge_row[col_idx]
+                typ = 'flat_discharge'
+            elif time_in_range(t, "11:00:00", "13:45:00"):
+                val = charge_row[col_idx]
+                typ = 'charge'
+            elif time_in_range(t, "14:00:00", "15:45:00"):
+                special_limit = total_power * afternoon_charge_ratio
+                val = min(charge_row[col_idx], special_limit)
+                typ = 'special_charge'
+            elif time_in_range(t, "16:00:00", "17:45:00"):
+                val = discharge_row[col_idx]
+                typ = 'peak_discharge' if is_peak_date else 'flat_discharge'
+            elif time_in_range(t, "18:00:00", "22:45:00"):
+                val = discharge_row[col_idx]
+                typ = 'flat_discharge'
+            elif time_in_range(t, "23:00:00", "23:45:00"):
+                val = charge_row[col_idx]
+                typ = 'charge'
+            else:
+                val = 0.0
+                typ = 'charge'
+            day_power[t] = val
+            formula[t] = typ
+        new_df.append({"日期": date, **day_power})
+        formula_map.append(formula)
+    return new_df, formula_map, times
+
+def sum_power(row_dict, time_list):
+    return sum(row_dict.get(t, 0.0) for t in time_list)
+
+def calc_detailed_stats(new_df, times, total_actual, morning_limit_ratio, afternoon_limit_ratio, afternoon_charge_ratio, charge_mode, daily_decay):
+    low1_times = [t for t in times if time_in_range(t, "00:00:00", "06:45:00")]
+    flat1_times = [t for t in times if time_in_range(t, "07:00:00", "10:45:00")]
+    low2_times = [t for t in times if time_in_range(t, "11:00:00", "13:45:00")]
+    flat2_times = [t for t in times if time_in_range(t, "14:00:00", "15:45:00")]
+    high_short_times = [t for t in times if time_in_range(t, "16:00:00", "17:45:00")]
+    high_extra_times = [t for t in times if time_in_range(t, "22:00:00", "22:45:00")]
+    high_long_times = [t for t in times if time_in_range(t, "16:00:00", "22:45:00")]
+    peak_times = [t for t in times if time_in_range(t, "18:00:00", "21:45:00")]
+    daily_list = []
+    prev_cycle2_remain = 0.0
+    initial_capacity = total_actual
+    for idx, row in enumerate(new_df):
+        date = row["日期"]
+        month = date.month
+        md = date.strftime("%m-%d")
+        current_cap = initial_capacity - daily_decay * initial_capacity * idx
+        morning_limit = current_cap * morning_limit_ratio
+        afternoon_limit = current_cap * afternoon_limit_ratio
+        system_retain = 0.0
+        # 第一次充放理论值
+        theo_low1 = min(sum_power(row, low1_times) / 4, current_cap)
+        theo_flat_charge1 = 0.0
+        theo_peak1 = 0.0
+        theo_high1 = 0.0
+        theo_flat_discharge1 = min(sum_power(row, flat1_times) / 4, current_cap)
+        # 第二次充放理论值
+        theo_low2 = min(sum_power(row, low2_times) / 4, current_cap)
+        theo_flat_charge2 = min((sum_power(row, flat2_times) / 4) * afternoon_charge_ratio, current_cap)
+        if ("01-01" <= md <= "01-31") or ("07-01" <= md <= "08-31") or ("12-01" <= md <= "12-31"):
+            theo_peak2 = min(sum_power(row, peak_times) / 4, current_cap)
+        else:
+            theo_peak2 = 0.0
+        if month in [1,7,8,12]:
+            high_sum = sum_power(row, high_short_times) + sum_power(row, high_extra_times)
+        else:
+            high_sum = sum_power(row, high_long_times)
+        theo_high2 = min(high_sum / 4, current_cap)
+        theo_flat_discharge2 = 0.0
+        # 第一次实际
+        if idx == 0:
+            actual_low1 = min(theo_low1, current_cap)
+            avail_flat_charge1 = current_cap - actual_low1
+            actual_flat_charge1 = min(theo_flat_charge1, avail_flat_charge1)
+            total_charge1 = actual_low1 + actual_flat_charge1
+            discharge_limit1 = min(total_charge1, morning_limit) - system_retain
+            actual_high1 = min(discharge_limit1, theo_high1)
+            remain1 = discharge_limit1 - actual_high1
+            actual_peak1 = min(remain1, theo_peak1)
+            remain1 -= actual_peak1
+            actual_flat_discharge1 = min(remain1, theo_flat_discharge1)
+            total_discharge1 = actual_high1 + actual_peak1 + actual_flat_discharge1
+            cycle1_remain = total_charge1 - total_discharge1
+        else:
+            actual_low1 = min(theo_low1, current_cap - prev_cycle2_remain)
+            avail_flat_charge1 = current_cap - actual_low1 - prev_cycle2_remain
+            actual_flat_charge1 = min(theo_flat_charge1, avail_flat_charge1)
+            total_charge1 = actual_low1 + actual_flat_charge1 + prev_cycle2_remain
+            discharge_limit1 = min(total_charge1, morning_limit) - system_retain
+            actual_high1 = min(discharge_limit1, theo_high1)
+            remain1 = discharge_limit1 - actual_high1
+            actual_peak1 = min(remain1, theo_peak1)
+            remain1 -= actual_peak1
+            actual_flat_discharge1 = min(remain1, theo_flat_discharge1)
+            total_discharge1 = actual_high1 + actual_peak1 + actual_flat_discharge1
+            cycle1_remain = total_charge1 - total_discharge1
+        # 第二次实际
+        avail_low2 = current_cap - cycle1_remain
+        actual_low2 = min(theo_low2, avail_low2)
+        avail_flat_charge2 = avail_low2 - actual_low2
+        actual_flat_charge2 = min(theo_flat_charge2, avail_flat_charge2)
+        total_charge2 = cycle1_remain + actual_low2 + actual_flat_charge2
+        discharge_limit2 = min(total_charge2, afternoon_limit) - system_retain
+        actual_peak2 = min(discharge_limit2, theo_peak2)
+        remain2 = discharge_limit2 - actual_peak2
+        actual_high2 = min(remain2, theo_high2)
+        actual_flat_discharge2 = 0.0
+        total_discharge2 = actual_peak2 + actual_high2 + actual_flat_discharge2
+        cycle2_remain = total_charge2 - total_discharge2
+        prev_cycle2_remain = cycle2_remain
+        # 汇总
+        cycle1 = actual_peak1 + actual_high1 + actual_flat_discharge1
+        cycle2 = actual_peak2 + actual_high2 + actual_flat_discharge2
+        total_discharge = cycle1 + cycle2
+        if charge_mode == 2:
+            eq_days = total_discharge / current_cap / 2
+        else:
+            eq_days = total_discharge / current_cap
+        full_days = total_discharge / (initial_capacity * 2)
+        cycle1_ratio = cycle1 / current_cap
+        cycle2_ratio = cycle2 / current_cap
+        low_charge = actual_low1 + actual_low2
+        flat_charge = actual_flat_charge1 + actual_flat_charge2
+        peak_discharge = actual_peak1 + actual_peak2
+        high_discharge = actual_high1 + actual_high2
+        flat_discharge = actual_flat_discharge1 + actual_flat_discharge2
+        theory_total_charge = min(theo_low1 + theo_flat_charge1 + theo_low2 + theo_flat_charge2, current_cap * 2)
+        theory_total_discharge = min(theo_peak1 + theo_high1 + theo_flat_discharge1 + theo_peak2 + theo_high2 + theo_flat_discharge2, current_cap * 2)
+        daily_list.append({
+            "日期": date.strftime("%Y-%m-%d"),
+            "月份": month,
+            "充电容量": current_cap,
+            "折算天数": eq_days,
+            "满容量天数": full_days,
+            "低谷充电": low_charge,
+            "平段充电": flat_charge,
+            "尖峰放电": peak_discharge,
+            "高峰放电": high_discharge,
+            "平段放电": flat_discharge,
+            "总放电": total_discharge,
+            "理论总可充电量": theory_total_charge,
+            "理论总可放电量": theory_total_discharge,
+            "第1次低谷可充电量": theo_low1,
+            "第1次平段可充电量": theo_flat_charge1,
+            "第1次尖峰可放电量": theo_peak1,
+            "第1次高峰可放电量": theo_high1,
+            "第1次平段可放电量": theo_flat_discharge1,
+            "第2次低谷可充电量": theo_low2,
+            "第2次平段可充电量": theo_flat_charge2,
+            "第2次尖峰可放电量": theo_peak2,
+            "第2次高峰可放电量": theo_high2,
+            "第2次平段可放电量": theo_flat_discharge2,
+            "第1次低谷充电量": actual_low1,
+            "第1次平段充电量": actual_flat_charge1,
+            "第1次尖峰放电量": actual_peak1,
+            "第1次高峰放电量": actual_high1,
+            "第1次平段放电量": actual_flat_discharge1,
+            "循环1剩余": cycle1_remain,
+            "第2次低谷充电量": actual_low2,
+            "第2次平段充电量": actual_flat_charge2,
+            "第2次尖峰放电量": actual_peak2,
+            "第2次高峰放电量": actual_high2,
+            "第2次平段放电量": actual_flat_discharge2,
+            "循环2剩余": cycle2_remain,
+            "循环1": cycle1,
+            "循环2": cycle2,
+            "循环1计数": cycle1_ratio,
+            "循环2计数": cycle2_ratio
+        })
+    return daily_list
+
+def aggregate_monthly_for_storage_config(daily_list):
+    month_days_map = {1:31, 2:28, 3:31, 4:30, 5:31, 6:30, 7:31, 8:31, 9:30, 10:31, 11:30, 12:31}
+    month_type_map = {1:"特殊", 2:"正常", 3:"正常", 4:"正常", 5:"正常", 6:"正常", 7:"特殊", 8:"特殊", 9:"正常", 10:"正常", 11:"正常", 12:"特殊"}
+    monthly_agg = {}
+    for d in daily_list:
+        m = d["月份"]
+        if m not in monthly_agg:
+            monthly_agg[m] = {
+                "天数": 0.0,
+                "折算天数": 0.0,
+                "谷充电量": 0.0,
+                "平充电量": 0.0,
+                "尖放电量": 0.0,
+                "峰放电量": 0.0,
+                "平放电量": 0.0,
+                "总放电量": 0.0,
+                "总理论可充电": 0.0,
+                "总理论可放电": 0.0,
+                "总充电容量2倍": 0.0
+            }
+        mon = monthly_agg[m]
+        mon["天数"] += d["满容量天数"]
+        mon["折算天数"] += d["折算天数"]
+        mon["谷充电量"] += d["低谷充电"]
+        mon["平充电量"] += d["平段充电"]
+        mon["尖放电量"] += d["尖峰放电"]
+        mon["峰放电量"] += d["高峰放电"]
+        mon["平放电量"] += d["平段放电"]
+        mon["总放电量"] += d["总放电"]
+        mon["总理论可充电"] += d["理论总可充电量"]
+        mon["总理论可放电"] += d["理论总可放电量"]
+        mon["总充电容量2倍"] += d["充电容量"] * 2
+    monthly_list = []
+    for m in range(1, 13):
+        if m in monthly_agg:
+            d = monthly_agg[m]
+            total_charge = d["谷充电量"] + d["平充电量"]
+            total_discharge = d["总放电量"]
+            ratio_charge = d["总理论可充电"] / d["总充电容量2倍"] if d["总充电容量2倍"] else 0
+            ratio_discharge = d["总理论可放电"] / d["总充电容量2倍"] if d["总充电容量2倍"] else 0
+            combined = min(ratio_charge, ratio_discharge)
+            diff = ratio_charge - ratio_discharge
+            if diff >= 0.05:
+                text = "消纳不足"
+            elif diff <= -0.05:
+                text = "充电不足"
+            else:
+                text = "充放平衡"
+            monthly_list.append({
+                "月份": m,
+                "分类": month_type_map[m],
+                "天数": round(d["天数"], 2),
+                "折算天数": round(d["折算天数"], 2),
+                "谷充电量(度)": round(d["谷充电量"], 2),
+                "平充电量(度)": round(d["平充电量"], 2),
+                "总充电量(度)": round(total_charge, 2),
+                "尖放电量(度)": round(d["尖放电量"], 2),
+                "峰放电量(度)": round(d["峰放电量"], 2),
+                "平放电量(度)": round(d["平放电量"], 2),
+                "总放电量(度)": round(total_discharge, 2),
+                "谷充电占比": round(d["谷充电量"] / total_charge if total_charge else 0, 4),
+                "平充电占比": round(d["平充电量"] / total_charge if total_charge else 0, 4),
+                "尖放电占比": round(d["尖放电量"] / total_discharge if total_discharge else 0, 4),
+                "峰放电占比": round(d["峰放电量"] / total_discharge if total_discharge else 0, 4),
+                "平放电占比": round(d["平放电量"] / total_discharge if total_discharge else 0, 4),
+                "每月天数": month_days_map[m],
+                "理论可充电情况": round(ratio_charge, 4),
+                "理论可放电情况": round(ratio_discharge, 4),
+                "综合充放电数值": round(combined, 4),
+                "综合充放电文本": text
+            })
+        else:
+            monthly_list.append({
+                "月份": m,
+                "分类": month_type_map[m],
+                "天数": 0.0,
+                "折算天数": 0.0,
+                "谷充电量(度)": 0.0,
+                "平充电量(度)": 0.0,
+                "总充电量(度)": 0.0,
+                "尖放电量(度)": 0.0,
+                "峰放电量(度)": 0.0,
+                "平放电量(度)": 0.0,
+                "总放电量(度)": 0.0,
+                "谷充电占比": 0.0,
+                "平充电占比": 0.0,
+                "尖放电占比": 0.0,
+                "峰放电占比": 0.0,
+                "平放电占比": 0.0,
+                "每月天数": month_days_map[m],
+                "理论可充电情况": 0.0,
+                "理论可放电情况": 0.0,
+                "综合充放电数值": 0.0,
+                "综合充放电文本": "无数据"
+            })
+    # 总计行（减去20）
+    total_days = sum(m["天数"] for m in monthly_list)
+    total_eq = sum(m["折算天数"] for m in monthly_list)
+    total_days = max(total_days, 0)
+    total_eq = max(total_eq, 0)
+    total_low = sum(m["谷充电量(度)"] for m in monthly_list)
+    total_flat_charge = sum(m["平充电量(度)"] for m in monthly_list)
+    total_peak = sum(m["尖放电量(度)"] for m in monthly_list)
+    total_high = sum(m["峰放电量(度)"] for m in monthly_list)
+    total_flat_discharge = sum(m["平放电量(度)"] for m in monthly_list)
+    total_charge = sum(m["总充电量(度)"] for m in monthly_list)
+    total_discharge = sum(m["总放电量(度)"] for m in monthly_list)
+    total_charge_ratio = total_charge / (total_eq * 2) if total_eq else 0
+    total_discharge_ratio = total_discharge / (total_eq * 2) if total_eq else 0
+    total_combined = min(total_charge_ratio, total_discharge_ratio)
+    monthly_list.append({
+        "月份": "总计",
+        "分类": "",
+        "天数": round(total_days, 2),
+        "折算天数": round(total_eq, 2),
+        "谷充电量(度)": round(total_low, 2),
+        "平充电量(度)": round(total_flat_charge, 2),
+        "总充电量(度)": round(total_charge, 2),
+        "尖放电量(度)": round(total_peak, 2),
+        "峰放电量(度)": round(total_high, 2),
+        "平放电量(度)": round(total_flat_discharge, 2),
+        "总放电量(度)": round(total_discharge, 2),
+        "谷充电占比": round(total_low / total_charge if total_charge else 0, 4),
+        "平充电占比": round(total_flat_charge / total_charge if total_charge else 0, 4),
+        "尖放电占比": round(total_peak / total_discharge if total_discharge else 0, 4),
+        "峰放电占比": round(total_high / total_discharge if total_discharge else 0, 4),
+        "平放电占比": round(total_flat_discharge / total_discharge if total_discharge else 0, 4),
+        "每月天数": 365,
+        "理论可充电情况": round(total_charge_ratio, 4),
+        "理论可放电情况": round(total_discharge_ratio, 4),
+        "综合充放电数值": round(total_combined, 4),
+        "综合充放电文本": ""
+    })
+    return monthly_list
+
+def generate_payback_table_data(run_days, discharge_tax, charge_tax, total_rated, total_actual, unit_count,
+                                 device_cost, construction_cost, discount_rate, brokerage_rate,
+                                 system_efficiency_payback, operation_cost_rate, tax_rate, interest_rate,
+                                 per_unit=True):
+    """
+    生成投资回收期表数据
+    修改说明：
+      - device_cost: 单台设备成本（万元/台）
+      - construction_cost: 单台施工成本（万元/台）
+      - 总设备成本 = device_cost * unit_count
+      - 总施工成本 = construction_cost * unit_count
+      - 不再对 total_rated / total_actual 进行缩放，始终使用总容量
+      - 添加项目税前利润、判断、间接法累计现金流三行
+      - 静态投资回收期基于间接法累计现金流计算
+    """
+    # 总设备成本、总施工成本
+    total_device_cost = device_cost * unit_count
+    total_construction_cost = construction_cost * unit_count
+    # 电价、容量等直接使用输入值（已为总值）
+    discharge_emic = discharge_tax
+    charge_emic = charge_tax
+    edingdianliang = total_rated          # 总额定容量（kWh）
+    chunengdianliang = total_actual       # 总实际容量（kWh）
+    taishu = 1                            # 系统套数，固定为1（因为已按总容量计算）
+    low_pressure_default_cost = total_device_cost
+    construction_default_cost = total_construction_cost
+    suodeshui = tax_rate
+    dianjiazhekou = discount_rate
+    nianlixi = interest_rate
+    baoxianbili = 0.0015
+    fangdianshendu = 1
+    xitongxiaolv = system_efficiency_payback
+    xiaoxiangshuilv = 0.13
+    JUJIAN = brokerage_rate
+    unit_om_cost = operation_cost_rate
+    di9diya = low_pressure_default_cost * taishu
+    di9shigong = construction_default_cost * taishu
+    # 折算为每10kWh的单位成本（用于后续计算）
+    di1diya = di9diya / edingdianliang * 10
+    di1shigong = di9shigong / edingdianliang * 10
+    # 第9年增补投资（含税）
+    invest_yr9 = round(0.4 * edingdianliang / 10 / 1.13, 4)
+    invest_tax_yr1 = (di1diya * edingdianliang / 10) + (di1shigong * edingdianliang / 10) + (JUJIAN * edingdianliang / 10)
+    invest_no_tax_yr1 = (di1diya * edingdianliang / 10 / 1.13) + (di1shigong * edingdianliang / 10) + (JUJIAN * edingdianliang / 10)
+    input_tax = round(invest_tax_yr1 - invest_no_tax_yr1, 4)
+    jujian_yr9 = [0.0] * 17
+    jujian_yr9[0] = round(edingdianliang * JUJIAN / 10, 4)
+    power_station_invest = [0.0] * 17
+    power_station_invest[0] = round(edingdianliang * di1diya / 10, 4)   # 等于 total_device_cost
+    power_station_invest[8] = round(invest_yr9 * 1.13, 4)
+    construction_invest = [0.0] * 17
+    construction_invest[0] = di9shigong
+    battery_ratio = [0.0, 0.965, 0.911, 0.877, 0.848, 0.823, 0.800, 0.778, 0.758,
+                     0.965, 0.911, 0.877, 0.848, 0.823, 0.800, 0.778, 0.758]
+    battery_percent = [f"{v*100:.1f}%" if v !=0 else "0.0%" for v in battery_ratio]
+    charge_kwh = [0.0] * 17
+    for n in range(1, 17):
+        charge_kwh[n] = round((run_days * chunengdianliang * fangdianshendu)*2 / 10000 /
+                              (1 - (1 - xitongxiaolv)/2) * battery_ratio[n], 2)
+    discharge_kwh = [0.0] * 17
+    for n in range(1, 17):
+        discharge_kwh[n] = round(xitongxiaolv * charge_kwh[n], 2)
+    cash_in = [0.0] * 17
+    for n in range(1, 17):
+        cash_in[n] = round((discharge_kwh[n] * discharge_emic - charge_kwh[n] * charge_emic) * dianjiazhekou, 2)
+    electricity_income = cash_in.copy()
+    operation_cost = [0.0] * 17
+    for n in range(1, 17):
+        operation_cost[n] = round(unit_om_cost * 20 * unit_count, 2)
+    insurance_cost = [0.0] * 17
+    for n in range(1, 17):
+        insurance_cost[n] = round(invest_no_tax_yr1 * baoxianbili, 4)
+    output_tax = [0.0] * 17
+    for n in range(1, 17):
+        output_tax[n] = round(cash_in[n] - cash_in[n]/(1 + xiaoxiangshuilv), 4)
+    vat_tax = [0.0] * 17
+    vat_tax[0] = round(output_tax[0] - input_tax, 4)
+    for n in range(1, 17):
+        vat_tax[n] = round(output_tax[n], 4)
+    pay_vat = [0.0] * 17
+    for n in range(1, 17):
+        sum_vat = sum(vat_tax[:n+1])
+        sum_pay_before = sum(pay_vat[:n])
+        if sum_vat > 0 and sum_pay_before == 0:
+            pay_vat[n] = round(sum_vat, 4)
+        elif sum_vat > 0 and sum_pay_before > 0:
+            pay_vat[n] = round(vat_tax[n], 4)
+        else:
+            pay_vat[n] = 0.0
+    tax_surcharge = [0.0] * 17
+    for n in range(1, 17):
+        tax_surcharge[n] = round(cash_in[n] * 3/10000 + pay_vat[n] * 0.12, 4)
+    depreciation = [0.0] * 17
+    depr_yr1_8 = round(invest_no_tax_yr1 * 0.95 / 8, 4)
+    depr_yr9_16 = round(power_station_invest[8] * 0.95 / (1.13 * 8), 4)
+    for n in range(1, 17):
+        if 1 <= n <= 8:
+            depreciation[n] = depr_yr1_8
+        elif 9 <= n <= 16:
+            depreciation[n] = depr_yr9_16
+    excel_cash_out = [0.0] * 17
+    excel_net_cash_flow = [0.0] * 17
+    excel_cum_cash_flow = [0.0] * 17
+    excel_interest = [0.0] * 17
+    excel_income_tax = [0.0] * 17
+    excel_cash_out[0] = round(di9diya + di9shigong + jujian_yr9[0], 4)
+    excel_net_cash_flow[0] = round(-excel_cash_out[0], 4)
+    excel_cum_cash_flow[0] = excel_net_cash_flow[0]
+    for n in range(1, 17):
+        if excel_cum_cash_flow[n-1] < 0:
+            excel_interest[n] = round(abs(excel_cum_cash_flow[n-1]) * nianlixi, 4)
+        else:
+            excel_interest[n] = 0.0
+        taxable_base = (
+            electricity_income[n] - operation_cost[n] - insurance_cost[n]
+            - tax_surcharge[n] - excel_interest[n] - depreciation[n] - output_tax[n]
+        )
+        excel_income_tax[n] = round(taxable_base * suodeshui, 4) 
+        excel_cash_out[n] = round(
+            power_station_invest[n] + jujian_yr9[n] + operation_cost[n] + insurance_cost[n]
+            + tax_surcharge[n] + excel_interest[n] + excel_income_tax[n] + pay_vat[n],
+            4
+        )
+        excel_net_cash_flow[n] = round(cash_in[n] - excel_cash_out[n], 4)
+        excel_cum_cash_flow[n] = round(excel_cum_cash_flow[n-1] + excel_net_cash_flow[n], 4)
+
+    # ====================== 新增三行计算逻辑 ======================
+    # 1. 项目税前利润
+    project_pre_tax_profit = [0.0] * 17
+    project_pre_tax_profit[0] = 0.0  # 第0年为0
+    for n in range(1, 17):
+        # 电费收入 - 运营成本 - 保险费用 - 税金及附加 - 利息 - 项目折旧 - 销项税
+        project_pre_tax_profit[n] = round(
+            electricity_income[n] - operation_cost[n] - insurance_cost[n]
+            - tax_surcharge[n] - excel_interest[n] - depreciation[n] - output_tax[n],
+            2
+        )
+
+    # 2. 判断（基于支付增值税）
+    judge_vat = [0.0] * 17
+    for n in range(17):
+        if pay_vat[n] <= 0:
+            judge_vat[n] = 0.0
+        else:
+            judge_vat[n] = pay_vat[n]
+
+    # 3. 间接法累计现金流
+    indirect_cum_cash_flow = [0.0] * 17
+    indirect_cum_cash_flow[0] = excel_cum_cash_flow[0]  # 第0年为累计现金流量
+    for n in range(1, 17):
+        # 项目折旧 + 项目税前利润 + 上一年间接法累计现金流 + 销项税 - 税金及附加 - 判断
+        indirect_cum_cash_flow[n] = round(
+            depreciation[n] + project_pre_tax_profit[n] + indirect_cum_cash_flow[n-1]
+            + output_tax[n] - tax_surcharge[n] - judge_vat[n],
+            4
+        )
+    # ====================== 新增计算逻辑结束 ======================
+
+    # 计算静态投资回收期（基于间接法累计现金流）
+    payback_yearly = [0.0] * 17
+    final_payback_text = "全周期无法回收投资"
+    break_even_year = None
+    for year_idx in range(17):
+        if indirect_cum_cash_flow[year_idx] >= 0:
+            break_even_year = year_idx
+            break
+    actual_final = 0.0
+    if break_even_year is not None:
+        if break_even_year == 0:
+            actual_final = 0.0
+            final_payback_text = "0.00年（已回收）"
+            for year_idx in range(17):
+                payback_yearly[year_idx] = "0.00年（已回收）"
+        else:
+            m = break_even_year - 1
+            numerator = abs(indirect_cum_cash_flow[m])
+            denominator = indirect_cum_cash_flow[m+1] - indirect_cum_cash_flow[m]
+            if denominator != 0:
+                calculated_pb_value = numerator / denominator
+                actual_final = round(m + calculated_pb_value, 2)
+                final_payback_text = f"{actual_final:.2f}年（已回收）"
+            else:
+                actual_final = round(m, 2)
+                final_payback_text = f"{actual_final:.2f}年（已回收）"
+            for year_idx in range(17):
+                if year_idx < break_even_year:
+                    if year_idx < 16:
+                        curr_cum = indirect_cum_cash_flow[year_idx]
+                        next_cum = indirect_cum_cash_flow[year_idx+1]
+                        if next_cum - curr_cum != 0:
+                            dynamic_pb = abs(curr_cum) / (next_cum - curr_cum)
+                            payback_yearly[year_idx] = f"{dynamic_pb:.2f}年（预测）"
+                        else:
+                            payback_yearly[year_idx] = "未回收"
+                    else:
+                        payback_yearly[year_idx] = "未回收"
+                else:
+                    payback_yearly[year_idx] = final_payback_text
+    else:
+        for year_idx in range(17):
+            payback_yearly[year_idx] = "未回收"
+    recovery_actual_str_list = []
+    for year_idx in range(17):
+        if indirect_cum_cash_flow[year_idx] >= 0 and year_idx > 0:
+            m = year_idx - 1
+            if indirect_cum_cash_flow[year_idx] - indirect_cum_cash_flow[m] != 0:
+                pb_val_interp = m + abs(indirect_cum_cash_flow[m]) / (indirect_cum_cash_flow[year_idx] - indirect_cum_cash_flow[m])
+                recovery_actual_str_list.append(f"{pb_val_interp:.2f}")
+            else:
+                recovery_actual_str_list.append("无法计算")
+        elif year_idx == 0 and indirect_cum_cash_flow[year_idx] >= 0:
+            recovery_actual_str_list.append("0.00")
+        else:
+            recovery_actual_str_list.append(" ")
+    while len(recovery_actual_str_list) < 17:
+        recovery_actual_str_list.append(" ")
+    year_headers = ['项目'] + [f'第{i}年' for i in range(0,17)] + ['合计']
+    data = [
+        ['电池容量', *battery_percent, '-'],
+        ['充电量（万度）', *charge_kwh, round(sum(charge_kwh), 4)],
+        ['放电量（万度）', *discharge_kwh, round(sum(discharge_kwh), 4)],
+        ['现金流入（电费收入）', *cash_in, round(sum(cash_in), 4)],
+        ['电费收入', *electricity_income, round(sum(electricity_income), 4)],
+        ['现金流出', *excel_cash_out, round(sum(excel_cash_out), 4)],
+        ['电站投资', *power_station_invest, round(sum(power_station_invest), 4)],
+        ['施工', *construction_invest, round(sum(construction_invest), 4)],
+        ['第9年居间', *jujian_yr9, round(sum(jujian_yr9), 4)],
+        ['运营成本', *operation_cost, round(sum(operation_cost), 4)],
+        ['保险费用', *insurance_cost, round(sum(insurance_cost), 4)],
+        ['税金及附加', *tax_surcharge, round(sum(tax_surcharge), 4)],
+        ['利息', *excel_interest, round(sum(excel_interest), 4)],
+        ['税费（所得税，非绝对值）', *excel_income_tax, round(sum(excel_income_tax), 4)],
+        ['支付增值税', *pay_vat, round(sum(pay_vat), 4)],
+        ['现金净流入', *excel_net_cash_flow, round(sum(excel_net_cash_flow), 4)],
+        ['累计现金流量', *excel_cum_cash_flow, round(excel_cum_cash_flow[-1], 4)],
+        ['项目折旧', *depreciation, round(sum(depreciation), 4)],
+        ['增值税', *vat_tax, round(sum(vat_tax), 4)],
+        ['销项税', *output_tax, round(sum(output_tax), 4)],
+        # ====================== 新增三行数据 ======================
+        ['项目税前利润', *project_pre_tax_profit, round(sum(project_pre_tax_profit), 2)],
+        ['判断', *judge_vat, round(sum(judge_vat), 4)],
+        ['间接法累计现金流', *indirect_cum_cash_flow, round(indirect_cum_cash_flow[-1], 4)],
+        # ====================== 新增数据结束 ======================
+        ['静态投资回收期', *payback_yearly, final_payback_text],
+        ['回收周期实测', *recovery_actual_str_list, f"{actual_final:.2f}" if actual_final is not None else "无法回收"],
+    ]
+    return year_headers, data
+
+def generate_profit_calculation_data(run_days, discharge_tax, charge_tax, total_rated, total_actual, unit_count,
+                                      device_cost, construction_cost, discount_rate,
+                                      system_efficiency_payback, operation_cost_rate, tax_rate, interest_rate,
+                                      per_unit=True):
+    """生成2充放收益测算表数据（横表格式）- 始终基于总设备数据，收益效率固定为88.5%"""
+    profit_efficiency = 0.885
+    discharge_tax_val = discharge_tax
+    charge_tax_val = charge_tax
+    cost_per_kwh = 1.05
+    initial_invest_excl = total_rated * cost_per_kwh / 10 / 1.13
+    initial_invest_tax = initial_invest_excl * 1.13
+    run_days_val = run_days
+    om_cost_rate = operation_cost_rate
+    tax_rate_val = tax_rate
+    interest_rate_val = interest_rate
+    emc_discount = discount_rate
+    battery_cap = [0.965, 0.911, 0.877, 0.848, 0.823, 0.800, 0.778, 0.758,
+                   0.965, 0.911, 0.877, 0.848, 0.823, 0.800, 0.778, 0.758]
+    years = list(range(1, 17))
+    epc_charge_vols = []
+    epc_discharge_vols = []
+    epc_incomes = []
+    epc_costs = []
+    epc_om_costs = []
+    epc_profits = []
+    epc_rois = []
+    epc_npvs = []
+    npv_accum = 0
+    for i in range(16):
+        charge_vol = total_actual * run_days_val / 10000 * 2 * battery_cap[i] / (1 - (0.5 - profit_efficiency/2))
+        discharge_vol = charge_vol * profit_efficiency
+        income = discharge_tax_val * discharge_vol
+        cost_charge = charge_tax_val * charge_vol
+        om_cost = 0 if i < 2 else unit_count * om_cost_rate * 20
+        profit_tax = income - cost_charge - om_cost
+        roi = profit_tax / initial_invest_tax if initial_invest_tax != 0 else 0
+        if i == 0:
+            npv = profit_tax - initial_invest_tax
+        else:
+            npv = npv_accum + profit_tax
+        npv_accum = npv
+        epc_charge_vols.append(charge_vol)
+        epc_discharge_vols.append(discharge_vol)
+        epc_incomes.append(income)
+        epc_costs.append(cost_charge)
+        epc_om_costs.append(om_cost)
+        epc_profits.append(profit_tax)
+        epc_rois.append(roi)
+        epc_npvs.append(npv)
+    emc_owner_profits = []
+    for i in range(16):
+        charge_vol = total_actual * run_days_val / 10000 * 2 * battery_cap[i] / (1 - (0.5 - profit_efficiency/2))
+        discharge_vol = charge_vol * profit_efficiency
+        owner_profit = (discharge_vol * discharge_tax_val - charge_vol * charge_tax_val) * (1 - emc_discount)
+        emc_owner_profits.append(owner_profit)
+    cum_10 = sum(emc_owner_profits[:10])
+    cum_12 = sum(emc_owner_profits[:12])
+    cum_15 = sum(emc_owner_profits[:15])
+    cum_16 = sum(emc_owner_profits[:16])
+    payback_period = ""
+    break_even_year = None
+    for i, npv_val in enumerate(epc_npvs):
+        if npv_val >= 0:
+            break_even_year = i
+            break
+    if break_even_year is not None:
+        if break_even_year == 0:
+            payback_period = "0.00年"
+        else:
+            m = break_even_year - 1
+            numerator = abs(epc_npvs[m])
+            denominator = epc_profits[break_even_year]
+            if denominator != 0:
+                payback_fraction = numerator / denominator
+                payback = m + payback_fraction
+                payback_period = f"{payback:.2f}年"
+            else:
+                payback_period = f"{break_even_year}.00年"
+    else:
+        payback_period = "未回收"
+    csv_buffer = StringIO()
+    writer = csv.writer(csv_buffer, quoting=csv.QUOTE_MINIMAL)
+    writer.writerow(["含税放电", "含税充电", "不含税放电", "不含税充电", "投资度数", "实际度数", "台数", "成本",
+                     "运行天数", "收益效率", "备注", "初始投资含税", "EPC16年含税收益",
+                     "EPC投资回收周期", "运维成本", "所得税", "利息", "EMC折扣"])
+    epc_16year_total_profit = sum(epc_profits)
+    top_values = [
+        discharge_tax_val, charge_tax_val, discharge_tax_val / 1.13, charge_tax_val / 1.13,
+        total_rated, total_actual, unit_count, cost_per_kwh, run_days_val, profit_efficiency,
+        "第1、2年免运维费用", initial_invest_tax, epc_16year_total_profit,
+        payback_period, f"{operation_cost_rate*100}%", f"{tax_rate_val*100}%",
+        f"{interest_rate_val*100}%", emc_discount
+    ]
+    writer.writerow(top_values)
+    writer.writerow(["初始投资不含税", initial_invest_excl])
+    writer.writerow([])
+    writer.writerow(["EPC模式业主投资回收期"])
+    writer.writerow(["年限"] + [str(y) for y in years])
+    epc_rows = [
+        ("储能容量(kwh)", [total_rated] * 16),
+        ("年运行天数(天)", [run_days_val] * 16),
+        ("收益效率", [profit_efficiency] * 16),
+        ("放电电价(元/kwh)", [discharge_tax_val] * 16),
+        ("充电电价(元/kwh)", [charge_tax_val] * 16),
+        ("电池容量", battery_cap),
+        ("充电量(万度)", epc_charge_vols),
+        ("放电量(万度)", epc_discharge_vols),
+        ("发电收入(万元)", epc_incomes),
+        ("购电成本(万元)", epc_costs),
+        ("运维成本(万元)", epc_om_costs),
+        ("含税收益(万元)", epc_profits),
+        ("ROI", epc_rois),
+        ("净现值(万元)", epc_npvs)
+    ]
+    for name, values in epc_rows:
+        writer.writerow([name] + [round(v, 4) if isinstance(v, float) else v for v in values])
+    writer.writerow([])
+    writer.writerow(["EMC模式业主收益情况"])
+    writer.writerow(["年限"] + [str(y) for y in years] + ["10年累计", "12年累计", "15年累计", "16年累计"])
+    emc_rows = [
+        ("储能容量(kwh)", [total_rated] * 16),
+        ("年运行天数(天)", [run_days_val] * 16),
+        ("收益效率", [profit_efficiency] * 16),
+        ("放电电价(元/kwh)", [discharge_tax_val] * 16),
+        ("充电电价(元/kwh)", [charge_tax_val] * 16),
+        ("电价折扣", [emc_discount] * 16),
+        ("储能分成", [1 - emc_discount] * 16),
+        ("电池容量", battery_cap),
+        ("充电度数(万度)", epc_charge_vols),
+        ("放电度数(万度)", epc_discharge_vols),
+        ("业主含税收益(万元)", emc_owner_profits)
+    ]
+    for name, values in emc_rows:
+        row = [name] + [round(v, 4) if isinstance(v, float) else v for v in values]
+        if name == "业主含税收益(万元)":
+            row += [round(cum_10, 4), round(cum_12, 4), round(cum_15, 4), round(cum_16, 4)]
+        else:
+            row += [""] * 4
+        writer.writerow(row)
+    writer.writerow(["累计收益"] + [""] * 16 + [round(cum_10, 4), round(cum_12, 4), round(cum_15, 4), round(cum_16, 4)])
+    return csv_buffer.getvalue()
+
+def to_csv_string(rows, headers):
+    output = StringIO()
+    writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
+    writer.writerow(headers)
+    writer.writerows(rows)
+    return output.getvalue()
+
+# ====================== 主入口函数（核心修改在此） ======================
+def main(**kwargs):
+    # ========== 1. 读取输入参数 ==========
+    file_text = safe_str(kwargs.get("file_text", ""))
+    if not file_text:
+        return {
+            "error": "输入文件内容为空",
+            "pivot_base64": "",
+            "power_matrix_base64": "",
+            "stats_base64": "",
+            "storage_config_base64": "",
+            "payback_base64": "",
+            "profit_calculation_base64": ""
+        }
+    output_detail = safe_int(kwargs.get("output_detail"), 0) == 1
+    per_unit = safe_int(kwargs.get("per_unit"), 1) == 1
+    unit_count = safe_int(kwargs.get("unit_count"), 2)
+    device_model = safe_str(kwargs.get("device_model"), "S1")
+    charge_mode = safe_int(kwargs.get("charge_mode"), 2)
+    # 手动输入的电价仅作为备用兜底，最终会被自动计算值覆盖
+    discharge_tax_backup = safe_float(kwargs.get("discharge_tax"), 0.9176)
+    charge_tax_backup = safe_float(kwargs.get("charge_tax"), 0.3466)
+    safety_factor = safe_float(kwargs.get("safety_factor"), 0.85)
+    transformer_capacity = safe_float(kwargs.get("transformer_capacity_kVA"), 400)
+    discount_rate = safe_float(kwargs.get("discount_rate"), 0.85)
+    brokerage_rate = safe_float(kwargs.get("brokerage_rate"), 0.05)
+    morning_limit_ratio = safe_float(kwargs.get("morning_discharge_limit_ratio"), 0.5)
+    afternoon_limit_ratio = safe_float(kwargs.get("afternoon_discharge_limit"), 1.0)
+    annual_decay_rate = safe_float(kwargs.get("annual_decay_rate"), 0.025)
+    system_efficiency_payback = safe_float(kwargs.get("system_efficiency_payback"), 0.865)
+    operation_cost_rate = safe_float(kwargs.get("operation_cost_rate"), 0.01)
+    tax_rate = safe_float(kwargs.get("tax_rate"), 0.05)
+    interest_rate = safe_float(kwargs.get("interest_rate"), 0.04)
+    afternoon_charge_ratio = 0.0
+
+    # ========== 2. 设备参数配置 ==========
+    device_specs = {
+        "S1": {1: (50, 225, 235, 11.6, 3.5), 2: (100, 225, 235, 11.6, 4.0)},
+        "S2": {1: (65, 261, 271, 14.0, 3.5), 2: (130, 261, 271, 14.0, 4.0)},
+        "X3": {1: (215, 836, 876, 44.308, 0.0), 2: (418, 836, 876, 44.308, 0.0)}
+    }
+    if device_model not in device_specs or charge_mode not in device_specs[device_model]:
+        raise ValueError(f"无效的设备组合: {device_model}, 模式 {charge_mode}")
+    power_per_unit, rated_per_unit, actual_per_unit, device_cost, construction_cost = device_specs[device_model][charge_mode]
+    total_power = power_per_unit * unit_count
+    total_rated = rated_per_unit * unit_count
+    total_actual = actual_per_unit * unit_count
+    power_limit = safety_factor * transformer_capacity
+    daily_decay = annual_decay_rate / 365
+
+    # ========== 3. 解析负荷数据 ==========
+    dates, times, date_power, info = parse_data_text(file_text)
+    if not dates:
+        return {
+            "error": f"无法解析数据: {info}",
+            "pivot_base64": "",
+            "power_matrix_base64": "",
+            "stats_base64": "",
+            "storage_config_base64": "",
+            "payback_base64": "",
+            "profit_calculation_base64": ""
+        }
+    pivot_data, times = pivot(dates, times, date_power)
+
+    # ========== 4. 生成充放电矩阵与详细统计 ==========
+    new_df, formula_map, _ = build_power_matrix(pivot_data, times, total_power, power_limit, afternoon_charge_ratio)
+    detailed_stats = calc_detailed_stats(new_df, times, total_actual, morning_limit_ratio, afternoon_limit_ratio,
+                                          afternoon_charge_ratio, charge_mode, daily_decay)
+
+    # ========== 5. 生成容量储能配置表（含总计行） ==========
+    monthly_config = aggregate_monthly_for_storage_config(detailed_stats)
+
+    # ========== 核心修改：自动计算加权平均充放电电价 ==========
+    # 定义固定时段平均电价
+    AVG_PRICE_PEAK =  1.3252     # 尖峰平均电价
+    AVG_PRICE_HIGH =  1.0915     # 高峰平均电价
+    AVG_PRICE_FLAT =  0.6499      # 平段平均电价
+    AVG_PRICE_LOW =  0.3128       # 低谷平均电价
+
+    # 提取总计行的充放电占比，自动计算电价
+    discharge_tax = discharge_tax_backup  # 默认使用备用值
+    charge_tax = charge_tax_backup
+    total_row = monthly_config[-1] if monthly_config else None
+    if total_row and total_row["月份"] == "总计":
+        # 提取放电各时段占比
+        peak_discharge_ratio = total_row.get("尖放电占比", 0.0)
+        high_discharge_ratio = total_row.get("峰放电占比", 0.0)
+        flat_discharge_ratio = total_row.get("平放电占比", 0.0)
+        # 提取充电各时段占比
+        low_charge_ratio = total_row.get("谷充电占比", 0.0)
+        flat_charge_ratio = total_row.get("平充电占比", 0.0)
+        
+        # 按公式计算加权平均含税电价
+        discharge_tax = (AVG_PRICE_PEAK * peak_discharge_ratio +
+                         AVG_PRICE_HIGH * high_discharge_ratio +
+                         AVG_PRICE_FLAT * flat_discharge_ratio)
+        charge_tax = (AVG_PRICE_LOW * low_charge_ratio +
+                      AVG_PRICE_FLAT * flat_charge_ratio)
+    # ========== 核心修改结束 ==========
+
+    # ========== 6. 生成各类输出表（使用自动计算的电价） ==========
+    total_eq_days = monthly_config[-1]["折算天数"] if monthly_config else 0.0
+
+    # 原始透视表处理
+    morning_peak_times = ["09:00:00", "09:15:00", "09:30:00", "09:45:00",
+                          "10:00:00", "10:15:00", "10:30:00", "10:45:00"]
+    afternoon_peak_times = ["15:00:00", "15:15:00", "15:30:00", "15:45:00",
+                            "16:00:00", "16:15:00", "16:30:00", "16:45:00"]
+    time_to_idx = {t: i for i, t in enumerate(times)}
+    morning_indices = [time_to_idx[t] for t in morning_peak_times if t in time_to_idx]
+    afternoon_indices = [time_to_idx[t] for t in afternoon_peak_times if t in time_to_idx]
+    extra_headers = ["最大需量（日）", "充电保护值", "尖最小功率", "1充放电容量（上午）", "1充放电容量（下午）", "充电容量", "系统留存"]
+    initial_capacity = total_actual
+    daily_capacities = []
+    for idx in range(len(pivot_data)):
+        current_cap = initial_capacity - daily_decay * initial_capacity * idx
+        daily_capacities.append(current_cap)
+    pivot_rows = []
+    for row in pivot_data:
+        date_str = row[0].strftime("%Y-%m-%d")
+        power_vals = row[1:]
+        pivot_rows.append([date_str] + power_vals)
+    pivot_rows_with_extra = []
+    for idx, row in enumerate(pivot_rows):
+        date_str = row[0]
+        power_vals = row[1:]
+        max_demand = max(power_vals) if power_vals else 0.0
+        morning_min = min([power_vals[i] for i in morning_indices]) if morning_indices else float('inf')
+        afternoon_min = min([power_vals[i] for i in afternoon_indices]) if afternoon_indices else float('inf')
+        peak_min = min(morning_min, afternoon_min) if (morning_indices and afternoon_indices) else 0.0
+        charge_cap = daily_capacities[idx]
+        morning_limit = charge_cap * morning_limit_ratio
+        afternoon_limit = charge_cap * afternoon_limit_ratio
+        extra_vals = [
+            round(max_demand, 2),
+            round(power_limit, 2),
+            round(peak_min, 2),
+            round(morning_limit, 2),
+            round(afternoon_limit, 2),
+            round(charge_cap, 2),
+            0.0
+        ]
+        pivot_rows_with_extra.append(row + extra_vals)
+    pivot_headers = ["日期"] + times + extra_headers
+    pivot_csv = to_csv_string(pivot_rows_with_extra, pivot_headers)
+    pivot_base64 = base64.b64encode(pivot_csv.encode('utf-8')).decode('utf-8') if output_detail else ""
+
+    # 充放电功率矩阵
+    power_matrix_rows = []
+    for row in new_df:
+        date_str = row["日期"].strftime("%Y-%m-%d")
+        power_vals = [row[t] for t in times]
+        power_matrix_rows.append([date_str] + power_vals)
+    power_matrix_headers = ["日期"] + times
+    power_matrix_csv = to_csv_string(power_matrix_rows, power_matrix_headers)
+    power_matrix_base64 = base64.b64encode(power_matrix_csv.encode('utf-8')).decode('utf-8') if output_detail else ""
+
+    # 详细统计表
+    stats_headers = [
+        "日期", "月份",
+        "第1次低谷可充电量", "第1次平段可充电量", "第1次尖峰可放电量", "第1次高峰可放电量", "第1次平段可放电量",
+        "第2次低谷可充电量", "第2次平段可充电量", "第2次尖峰可放电量", "第2次高峰可放电量", "第2次平段可放电量",
+        "理论总可充电量", "理论总可放电量",
+        "第1次低谷充电量", "第1次平段充电量", "第1次尖峰放电量", "第1次高峰放电量", "第1次平段放电量", "循环1剩余",
+        "第2次低谷充电量", "第2次平段充电量", "第2次尖峰放电量", "第2次高峰放电量", "第2次平段放电量", "循环2剩余",
+        "循环1", "循环2", "折算天数", "循环1计数", "循环2计数",
+        "低谷充电", "平段充电", "尖峰放电", "高峰放电", "平段放电", "总放电", "满容量天数"
+    ]
+    stats_rows = []
+    for d in detailed_stats:
+        row = [
+            d.get("日期", ""), d.get("月份", 0),
+            d.get("第1次低谷可充电量", 0.0), d.get("第1次平段可充电量", 0.0),
+            d.get("第1次尖峰可放电量", 0.0), d.get("第1次高峰可放电量", 0.0), d.get("第1次平段可放电量", 0.0),
+            d.get("第2次低谷可充电量", 0.0), d.get("第2次平段可充电量", 0.0),
+            d.get("第2次尖峰可放电量", 0.0), d.get("第2次高峰可放电量", 0.0), d.get("第2次平段可放电量", 0.0),
+            d.get("理论总可充电量", 0.0), d.get("理论总可放电量", 0.0),
+            d.get("第1次低谷充电量", 0.0), d.get("第1次平段充电量", 0.0),
+            d.get("第1次尖峰放电量", 0.0), d.get("第1次高峰放电量", 0.0), d.get("第1次平段放电量", 0.0),
+            d.get("循环1剩余", 0.0),
+            d.get("第2次低谷充电量", 0.0), d.get("第2次平段充电量", 0.0),
+            d.get("第2次尖峰放电量", 0.0), d.get("第2次高峰放电量", 0.0), d.get("第2次平段放电量", 0.0),
+            d.get("循环2剩余", 0.0),
+            d.get("循环1", 0.0), d.get("循环2", 0.0), d.get("折算天数", 0.0),
+            d.get("循环1计数", 0.0), d.get("循环2计数", 0.0),
+            d.get("低谷充电", 0.0), d.get("平段充电", 0.0), d.get("尖峰放电", 0.0),
+            d.get("高峰放电", 0.0), d.get("平段放电", 0.0), d.get("总放电", 0.0), d.get("满容量天数", 0.0)
+        ]
+        row = [round(v, 4) if isinstance(v, float) else v for v in row]
+        stats_rows.append(row)
+    stats_csv = to_csv_string(stats_rows, stats_headers)
+    stats_base64 = base64.b64encode(stats_csv.encode('utf-8')).decode('utf-8')
+
+    # 容量-储能配置表（更新自动计算的电价）
+    monthly_headers = [
+        "月份", "分类", "天数", "折算天数", "谷充电量(度)", "平充电量(度)", "总充电量(度)",
+        "尖放电量(度)", "峰放电量(度)", "平放电量(度)", "总放电量(度)",
+        "谷充电占比", "平充电占比", "尖放电占比", "峰放电占比", "平放电占比",
+        "每月天数", "理论可充电情况", "理论可放电情况", "综合充放电数值", "综合充放电文本"
+    ]
+    monthly_rows = []
+    for m in monthly_config:
+        row = [
+            m["月份"], m["分类"], m["天数"], m["折算天数"], m["谷充电量(度)"], m["平充电量(度)"], m["总充电量(度)"],
+            m["尖放电量(度)"], m["峰放电量(度)"], m["平放电量(度)"], m["总放电量(度)"],
+            m["谷充电占比"], m["平充电占比"], m["尖放电占比"], m["峰放电占比"], m["平放电占比"],
+            m["每月天数"], m["理论可充电情况"], m["理论可放电情况"], m["综合充放电数值"], m["综合充放电文本"]
+        ]
+        monthly_rows.append(row)
+
+    # 配置表基础信息
+    config_headers1 = [
+        "变压器容量(kVA)", "安全系数", "功率上限(kW)", "基本电费", "需量数据选择", "充放模式",
+        "设备型号", "台数", "系统功率(kW)", "系统额定电量(kWh)", "夏冬尖峰前峰放电倍率",
+        "夏冬尖峰后峰放电倍率", "放电保护", "设备规格(功率)", "设备规格(标定容量)", "设备规格(实际容量)"
+    ]
+    config_row1 = [
+        transformer_capacity,
+        safety_factor,
+        power_limit,
+        "按容",
+        "电费清单",
+        charge_mode,
+        device_model,
+        unit_count,
+        total_power,
+        total_rated,
+        1.0,
+        1.0,
+        total_power * 0.1,
+        power_per_unit,
+        rated_per_unit,
+        actual_per_unit
+    ]
+    config_headers2 = [
+        "临界容量", "需量保护值", "DOD", "年衰减率", "日衰减率", "商务模式",
+        "折扣", "居间", "含税充电电价(元/kWh)", "含税放电电价(元/kWh)",
+        "系统实际电量(kWh)", "上午天数折算系数", "上午限制放电量",
+        "下午限制放电量", "14-15点平段充电倍率", "0.5C有效天数", "2充放回收期间接法"
+    ]
+    # 回收期表（使用自动计算的电价）
+    payback_headers, payback_data = generate_payback_table_data(
+        total_eq_days, discharge_tax, charge_tax, total_rated, total_actual, unit_count,
+        device_cost, construction_cost, discount_rate, brokerage_rate,
+        system_efficiency_payback, operation_cost_rate, tax_rate, interest_rate,
+        per_unit=per_unit
+    )
+    payback_text = payback_data[-2][-1] if payback_data else ""
+    config_row2 = [
+        transformer_capacity * 0.625,
+        178.45,
+        "100%",
+        f"{annual_decay_rate*100:.2f}%",
+        f"{annual_decay_rate/365*100:.3f}%",
+        "EMC",
+        discount_rate,
+        brokerage_rate,
+        round(charge_tax, 4),
+        round(discharge_tax, 4),
+        total_actual,
+        "100%",
+        f"{morning_limit_ratio*100}%",
+        f"{afternoon_limit_ratio*100}%",
+        "0%",
+        round(total_eq_days, 2),
+        payback_text
+    ]
+    # 构建储能配置CSV
+    csv_buffer = StringIO()
+    writer = csv.writer(csv_buffer, quoting=csv.QUOTE_MINIMAL)
+    writer.writerow(monthly_headers)
+    writer.writerows(monthly_rows)
+    writer.writerow([])
+    writer.writerow(config_headers1)
+    writer.writerow(config_row1)
+    writer.writerow(config_headers2)
+    writer.writerow(config_row2)
+    storage_config_csv = csv_buffer.getvalue()
+    storage_config_base64 = base64.b64encode(storage_config_csv.encode('utf-8')).decode('utf-8')
+
+    # 回收期表CSV
+    payback_csv_buffer = StringIO()
+    writer_pb = csv.writer(payback_csv_buffer, quoting=csv.QUOTE_MINIMAL)
+    writer_pb.writerow(payback_headers)
+    writer_pb.writerows(payback_data)
+    payback_csv = payback_csv_buffer.getvalue()
+    payback_base64 = base64.b64encode(payback_csv.encode('utf-8')).decode('utf-8')
+
+    # 2充放收益测算表（使用自动计算的电价）
+    profit_csv = generate_profit_calculation_data(
+        total_eq_days, discharge_tax, charge_tax, total_rated, total_actual, unit_count,
+        device_cost, construction_cost, discount_rate,
+        system_efficiency_payback, operation_cost_rate, tax_rate, interest_rate,
+        per_unit=per_unit
+    )
+    profit_calculation_baimport csv
+import base64
+import math
+from datetime import datetime
+from collections import defaultdict
+from io import StringIO
+
+# ====================== 辅助函数 ======================
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except:
+        return default
+
+def safe_int(value, default):
+    try:
+        return int(float(value))
+    except:
+        return default
+
+def safe_str(value, default=""):
+    return str(value).strip() if value is not None else default
+
+def parse_time(t):
+    h, m, s = map(int, t.split(':'))
+    return h * 60 + m + s // 60
+
+def time_in_range(t, start, end):
+    return parse_time(start) <= parse_time(t) <= parse_time(end)
+
+def try_parse_date(date_str):
+    date_str = safe_str(date_str)
+    if not date_str:
+        return None
+    formats = [
+        "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d",
+        "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S",
+        "%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y",
+        "%Y%m%d"
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_str, fmt).date()
+        except:
+            continue
+    return None
+
+def try_parse_time(time_str):
+    time_str = safe_str(time_str)
+    if not time_str:
+        return "00:00:00"
+    formats = [
+        "%H:%M:%S", "%H:%M", "%H:%M:%S.%f",
+        "%H时%M分%S秒", "%H时%M分"
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(time_str, fmt).strftime("%H:%M:%S")
+        except:
+            continue
+    return "00:00:00"
+
+def parse_markdown_table(text):
+    rows = []
+    text = safe_str(text)
+    if not text:
+        return rows, "输入为空"
+    lines = text.split("\n")
+    for line in lines:
+        line = line.strip()
+        if not line or all(c in '-|= ' for c in line):
+            continue
+        cols = [safe_str(col).strip() for col in line.split("|")]
+        if cols and cols[0] == "":
+            cols = cols[1:]
+        if cols and cols[-1] == "":
+            cols = cols[:-1]
+        if len(cols) < 4:
+            continue
+        date_str = cols[1]
+        time_str = cols[2]
+        power_str = cols[3]
+        date_obj = try_parse_date(date_str)
+        if not date_obj:
+            continue
+        time_obj = try_parse_time(time_str)
+        power = safe_float(power_str)
+        rows.append({
+            "日期": date_obj,
+            "时间": time_obj,
+            "瞬时有功": power
+        })
+    return rows, f"解析到 {len(rows)} 行有效数据"
+
+def parse_csv_text(csv_text):
+    csv_text = csv_text.strip()
+    if csv_text.startswith('\ufeff'):
+        csv_text = csv_text[1:]
+    try:
+        reader = csv.DictReader(StringIO(csv_text))
+        if not reader.fieldnames:
+            return [], [], {}, "CSV 文件无列名"
+        headers = [h.strip() for h in reader.fieldnames]
+        date_col = None
+        time_col = None
+        power_col = None
+        for h in headers:
+            h_lower = h.lower()
+            if h_lower in ['日期', 'date', '日', 'day']:
+                date_col = h
+            elif h_lower in ['时间', 'time', '时刻']:
+                time_col = h
+            elif h_lower in ['瞬时有功', '有功', 'power', 'load', '有功功率']:
+                power_col = h
+        if date_col is None and len(headers) >= 1:
+            date_col = headers[0]
+        if time_col is None and len(headers) >= 2:
+            time_col = headers[1]
+        if power_col is None and len(headers) >= 3:
+            power_col = headers[2]
+        if date_col is None or time_col is None or power_col is None:
+            return [], [], {}, f"无法确定列，实际列名 {headers}"
+        date_power = defaultdict(dict)
+        all_times = set()
+        for row in reader:
+            date_str = safe_str(row.get(date_col))
+            time_str = safe_str(row.get(time_col))
+            power = safe_float(row.get(power_col))
+            if not date_str or not time_str:
+                continue
+            try:
+                date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            except:
+                continue
+            date_power[date][time_str] = power
+            all_times.add(time_str)
+        dates = sorted(date_power.keys())
+        times = sorted(all_times)
+        return dates, times, date_power, f"成功解析 {len(dates)} 天"
+    except Exception as e:
+        return [], [], {}, f"CSV解析异常: {str(e)}"
+
+def parse_data_text(text):
+    text = safe_str(text)
+    if not text:
+        return [], [], {}, "输入为空"
+    md_rows, md_info = parse_markdown_table(text)
+    if md_rows:
+        date_power = defaultdict(dict)
+        all_times = set()
+        for r in md_rows:
+            date = r["日期"]
+            time_str = r["时间"]
+            power = r["瞬时有功"]
+            date_power[date][time_str] = power
+            all_times.add(time_str)
+        dates = sorted(date_power.keys())
+        times = sorted(all_times)
+        return dates, times, date_power, f"Markdown解析成功: {md_info}"
+    dates, times, date_power, csv_info = parse_csv_text(text)
+    if dates:
+        return dates, times, date_power, f"CSV解析成功: {csv_info}"
+    return [], [], {}, f"无法解析数据，请确保格式为CSV或Markdown表格。Markdown解析信息: {md_info}, CSV解析信息: {csv_info}"
+
+def pivot(dates, times, date_power):
+    pivot = []
+    for date in dates:
+        row = [date]
+        for t in times:
+            row.append(date_power.get(date, {}).get(t, 0.0))
+        pivot.append(row)
+    return pivot, times
+
+# ====================== 时段定义（安徽本地规则） ======================
+上午固定平段列表 = ["09:00:00", "09:15:00", "09:30:00", "09:45:00", "10:00:00", "10:15:00", "10:30:00", "10:45:00"]
+历史规则1_时段列表 = ["15:00:00", "15:15:00", "15:30:00", "15:45:00"]
+历史规则2_时段列表 = ["16:00:00", "16:15:00", "16:30:00", "16:45:00", "17:00:00", "17:15:00", "17:30:00", "17:45:00", "18:00:00", "18:15:00", "18:30:00", "18:45:00", "19:00:00", "19:15:00", "19:30:00", "19:45:00", "20:00:00", "20:15:00", "20:30:00", "20:45:00", "21:00:00", "21:15:00", "21:30:00", "21:45:00", "22:00:00", "22:15:00", "22:30:00", "22:45:00"]
+历史规则3_时段列表 = ["16:00:00", "16:15:00", "16:30:00", "16:45:00", "17:00:00", "17:15:00", "17:30:00", "17:45:00", "18:00:00", "18:15:00", "18:30:00", "18:45:00", "19:00:00", "19:15:00", "19:30:00", "19:45:00"]
+历史规则4_时段列表 = ["15:00:00", "15:15:00", "15:30:00", "15:45:00", "16:00:00", "16:15:00", "16:30:00", "16:45:00", "17:00:00", "17:15:00", "17:30:00", "17:45:00", "18:00:00", "18:15:00", "18:30:00", "18:45:00"]
+新规则1_时段列表 = ["15:00:00", "15:15:00", "15:30:00", "15:45:00"]
+新规则2_时段列表 = ["16:00:00", "16:15:00", "16:30:00", "16:45:00", "17:00:00", "17:15:00", "17:30:00", "17:45:00", "18:00:00", "18:15:00", "18:30:00", "18:45:00", "19:00:00", "19:15:00", "19:30:00", "19:45:00"]
+新规则3_时段列表 = ["20:00:00", "20:15:00", "20:30:00", "20:45:00", "21:00:00", "21:15:00", "21:30:00", "21:45:00", "22:00:00", "22:15:00", "22:30:00", "22:45:00"]
+新规则23点时段列表 = ["23:00:00", "23:15:00", "23:30:00", "23:45:00"]
+需求_12月下旬_19点时段 = ["19:00:00", "19:15:00", "19:30:00", "19:45:00"]
+上午尖峰时段列表 = 上午固定平段列表.copy()
+下午尖峰时段列表 = ["15:00:00", "15:15:00", "15:30:00", "15:45:00", "16:00:00", "16:15:00", "16:30:00", "16:45:00"]
+
+def build_power_matrix(pivot, times, total_power, power_limit, afternoon_charge_ratio):
+    """根据安徽本地充放电策略生成充放电矩阵"""
+    new_df = []
+    formula_map = []
+    # 预处理每个时刻是否属于各时段
+    time_to_idx = {t: i for i, t in enumerate(times)}
+    # 创建时段布尔列表
+    is_in_上午固定平段 = [t in 上午固定平段列表 for t in times]
+    is_in_历史规则1 = [t in 历史规则1_时段列表 for t in times]
+    is_in_历史规则2 = [t in 历史规则2_时段列表 for t in times]
+    is_in_历史规则3 = [t in 历史规则3_时段列表 for t in times]
+    is_in_历史规则4 = [t in 历史规则4_时段列表 for t in times]
+    is_in_新规则1 = [t in 新规则1_时段列表 for t in times]
+    is_in_新规则2 = [t in 新规则2_时段列表 for t in times]
+    is_in_新规则3 = [t in 新规则3_时段列表 for t in times]
+    is_in_新规则23点 = [t in 新规则23点时段列表 for t in times]
+    is_in_需求_12月下旬_19点 = [t in 需求_12月下旬_19点时段 for t in times]
+
+    for row_idx, row in enumerate(pivot):
+        date = row[0]
+        power_vals = row[1:]
+        charge_row = [max(0, min(total_power, power_limit - p)) for p in power_vals]
+        discharge_row = [max(0, min(total_power, p - total_power * 0.1)) for p in power_vals]
+        month = date.month
+        md = date.strftime("%m-%d")
+        is_7_to_9_month = 7 <= month <= 9
+        is_2_to_11_month = 2 <= month <= 11
+
+        day_power = {}
+        formula = {}
+        for col_idx, t in enumerate(times):
+            cell_value = 0.0
+            formula_type = 'idle'
+
+            # 1. 需求_12月下旬_19点时段 (12月16日之后)
+            if is_in_需求_12月下旬_19点[col_idx] and md >= "12-16":
+                cell_value = discharge_row[col_idx]
+                formula_type = 'flat_discharge'
+            # 2. 新规则23点时段
+            elif is_in_新规则23点[col_idx]:
+                if "01-01" <= md <= "06-30" or "10-01" <= md <= "12-31":
+                    cell_value = charge_row[col_idx]
+                    formula_type = 'charge'
+                elif "07-01" <= md <= "09-30":
+                    cell_value = discharge_row[col_idx]
+                    formula_type = 'flat_discharge'
+            # 3. 新规则1时段 (02-01 至 12-15)
+            elif is_in_新规则1[col_idx] and "02-01" <= md <= "12-15":
+                cell_value = charge_row[col_idx]
+                formula_type = 'charge'
+            # 4. 新规则2时段 (09-01 至 12-15)
+            elif is_in_新规则2[col_idx] and "09-01" <= md <= "12-15":
+                cell_value = discharge_row[col_idx]
+                formula_type = 'flat_discharge'
+            # 5. 新规则3时段 (07-15 之后)
+            elif is_in_新规则3[col_idx] and md >= "07-15":
+                cell_value = discharge_row[col_idx]
+                formula_type = 'flat_discharge'
+            # 6. 历史规则4时段 (12-16 之后)
+            elif is_in_历史规则4[col_idx] and md >= "12-16":
+                cell_value = discharge_row[col_idx]
+                formula_type = 'peak_discharge'
+            # 7. 历史规则3时段 (07-15 至 08-31)
+            elif is_in_历史规则3[col_idx] and "07-15" <= md <= "08-31":
+                cell_value = discharge_row[col_idx]
+                formula_type = 'peak_discharge'
+            # 8. 历史规则2时段 (至 07-14)
+            elif is_in_历史规则2[col_idx] and md <= "07-14":
+                cell_value = discharge_row[col_idx]
+                formula_type = 'flat_discharge'
+            # 9. 历史规则1时段 (至 01-31)
+            elif is_in_历史规则1[col_idx] and md <= "01-31":
+                cell_value = discharge_row[col_idx]
+                formula_type = 'peak_discharge'
+            # 10. 上午固定平段
+            elif is_in_上午固定平段[col_idx]:
+                cell_value = discharge_row[col_idx]
+                formula_type = 'flat_discharge'
+            # 11. 兜底规则（按原始逻辑补充）
+            else:
+                # 其他时段：根据索引范围判断
+                if col_idx < 24:  # 前24个点 (00:00-05:45)
+                    cell_value = charge_row[col_idx]
+                    formula_type = 'charge'
+                elif 24 <= col_idx <= 35:  # 06:00-08:45
+                    if is_7_to_9_month:
+                        cell_value = charge_row[col_idx]
+                        formula_type = 'charge'
+                    else:
+                        cell_value = discharge_row[col_idx]
+                        formula_type = 'flat_discharge'
+                elif 44 <= col_idx <= 47:  # 11:00-11:45
+                    if is_2_to_11_month:
+                        cell_value = charge_row[col_idx]
+                        formula_type = 'charge'
+                    else:
+                        cell_value = discharge_row[col_idx]
+                        formula_type = 'flat_discharge'
+                elif 48 <= col_idx <= 59:  # 12:00-14:45
+                    cell_value = charge_row[col_idx]
+                    formula_type = 'charge'
+                else:
+                    cell_value = 0.0
+                    formula_type = 'idle'
+
+            day_power[t] = cell_value
+            formula[t] = formula_type
+
+        new_df.append({"日期": date, **day_power})
+        formula_map.append(formula)
+    return new_df, formula_map, times
+
+def sum_power(row_dict, time_list):
+    return sum(row_dict.get(t, 0.0) for t in time_list)
+
+def calc_detailed_stats(new_df, times, total_actual, morning_limit_ratio, afternoon_limit_ratio, afternoon_charge_ratio, charge_mode, daily_decay):
+    """计算详细统计数据（安徽规则版本）"""
+    # 定义时段分组（与测试文件一致）
+    低谷时段_cols = [t for t in times if t >= "00:00:00" and t <= "05:45:00"]
+    高峰放电时段_cols = [t for t in times if t >= "06:00:00" and t <= "07:45:00"]
+    平段放电_1月12月_cols = [t for t in times if t >= "06:00:00" and t <= "11:45:00"]
+    平段放电_2_6_10_11月_cols = [t for t in times if t >= "08:00:00" and t <= "10:45:00"]
+    平段放电_7_9月_cols = [t for t in times if t >= "09:00:00" and t <= "10:45:00"]
+    第二次_低谷_1月12月_cols = [t for t in times if t >= "12:00:00" and t <= "13:45:00"]
+    第二次_低谷_2_6_10_11月_cols = [t for t in times if t >= "11:00:00" and t <= "13:45:00"]
+    第二次_低谷_7_9月_cols = [t for t in times if t >= "11:00:00" and t <= "12:45:00"]
+    第二次_平段_1月12月_cols = [t for t in times if t >= "14:00:00" and t <= "14:45:00"]
+    第二次_平段_2_6_10_11月_cols = [t for t in times if t >= "14:00:00" and t <= "15:45:00"]
+    第二次_平段_7_9月_cols = [t for t in times if t >= "13:00:00" and t <= "15:45:00"]
+    第二次_尖峰_1月_12月下旬_cols = [t for t in times if t >= "19:00:00" and t <= "20:45:00"]
+    第二次_尖峰_7_8月_cols = [t for t in times if t >= "20:00:00" and t <= "21:45:00"]
+    第二次_高峰_1月_12月16_31_cols_part1 = [t for t in times if t >= "15:00:00" and t <= "18:45:00"]
+    第二次_高峰_1月_12月16_31_cols_part2 = [t for t in times if t >= "21:00:00" and t <= "22:45:00"]
+    第二次_高峰_2_7月14_cols = [t for t in times if t >= "16:00:00" and t <= "21:45:00"]
+    第二次_高峰_7_8月_part1 = [t for t in times if t >= "16:00:00" and t <= "19:45:00"]
+    第二次_高峰_7_8月_part2 = [t for t in times if t >= "22:00:00" and t <= "23:45:00"]
+    第二次_高峰_9月_cols = [t for t in times if t >= "16:00:00" and t <= "23:45:00"]
+    第二次_高峰_10_11月_cols = [t for t in times if t >= "16:00:00" and t <= "21:45:00"]
+    第二次_高峰_12月1_15_cols = [t for t in times if t >= "15:00:00" and t <= "22:45:00"]
+
+    daily_list = []
+    prev_cycle2_remain = 0.0
+    initial_capacity = total_actual
+    for idx, row in enumerate(new_df):
+        date = row["日期"]
+        month = date.month
+        md = date.strftime("%m-%d")
+        current_cap = initial_capacity - daily_decay * initial_capacity * idx
+        morning_limit = current_cap * morning_limit_ratio
+        afternoon_limit = current_cap * afternoon_limit_ratio
+        system_retain = 0.0
+
+        # 第一次充放理论值
+        theo_low1 = min(sum_power(row, 低谷时段_cols) / 4, current_cap)
+        theo_flat_charge1 = 0.0
+        theo_peak1 = 0.0
+
+        if ("02-01" <= md <= "06-30") or ("10-01" <= md <= "11-30"):
+            theo_high1 = min(sum_power(row, 高峰放电时段_cols) / 4, current_cap)
+        else:
+            theo_high1 = 0.0
+
+        if "01-01" <= md <= "01-31" or "12-01" <= md <= "12-31":
+            平段计算时段 = 平段放电_1月12月_cols
+        elif "02-01" <= md <= "06-30" or "10-01" <= md <= "11-30":
+            平段计算时段 = 平段放电_2_6_10_11月_cols
+        elif "07-01" <= md <= "09-30":
+            平段计算时段 = 平段放电_7_9月_cols
+        else:
+            平段计算时段 = []
+        theo_flat_discharge1 = min(sum_power(row, 平段计算时段) / 4, current_cap) if 平段计算时段 else 0.0
+
+        # 第二次充放理论值
+        if "01-01" <= md <= "01-31" or "12-01" <= md <= "12-31":
+            第二次_低谷计算时段 = 第二次_低谷_1月12月_cols
+        elif "02-01" <= md <= "06-30" or "10-01" <= md <= "11-30":
+            第二次_低谷计算时段 = 第二次_低谷_2_6_10_11月_cols
+        elif "07-01" <= md <= "09-30":
+            第二次_低谷计算时段 = 第二次_低谷_7_9月_cols
+        else:
+            第二次_低谷计算时段 = []
+        theo_low2 = min(sum_power(row, 第二次_低谷计算时段) / 4, current_cap) if 第二次_低谷计算时段 else 0.0
+
+        if "01-01" <= md <= "01-31" or "12-01" <= md <= "12-31":
+            第二次_平段计算时段 = 第二次_平段_1月12月_cols
+        elif "02-01" <= md <= "06-30" or "10-01" <= md <= "11-30":
+            第二次_平段计算时段 = 第二次_平段_2_6_10_11月_cols
+        elif "07-01" <= md <= "09-30":
+            第二次_平段计算时段 = 第二次_平段_7_9月_cols
+        else:
+            第二次_平段计算时段 = []
+        theo_flat_charge2 = min((sum_power(row, 第二次_平段计算时段) / 4) * afternoon_charge_ratio, current_cap) if 第二次_平段计算时段 else 0.0
+
+        if "01-01" <= md <= "01-31":
+            theo_peak2 = min(sum_power(row, 第二次_尖峰_1月_12月下旬_cols) / 4, current_cap)
+        elif "02-01" <= md <= "07-14":
+            theo_peak2 = 0.0
+        elif "07-15" <= md <= "08-31":
+            theo_peak2 = min(sum_power(row, 第二次_尖峰_7_8月_cols) / 4, current_cap)
+        elif "09-01" <= md <= "12-15":
+            theo_peak2 = 0.0
+        elif "12-16" <= md <= "12-31":
+            theo_peak2 = min(sum_power(row, 第二次_尖峰_1月_12月下旬_cols) / 4, current_cap)
+        else:
+            theo_peak2 = 0.0
+
+        if "01-01" <= md <= "01-31":
+            sum1 = sum_power(row, 第二次_高峰_1月_12月16_31_cols_part1)
+            sum2 = sum_power(row, 第二次_高峰_1月_12月16_31_cols_part2)
+            theo_high2 = min((sum1 + sum2) / 4, current_cap)
+        elif "02-01" <= md <= "07-14":
+            theo_high2 = min(sum_power(row, 第二次_高峰_2_7月14_cols) / 4, current_cap)
+        elif "07-15" <= md <= "08-31":
+            sum1 = sum_power(row, 第二次_高峰_7_8月_part1)
+            sum2 = sum_power(row, 第二次_高峰_7_8月_part2)
+            theo_high2 = min((sum1 + sum2) / 4, current_cap)
+        elif "09-01" <= md <= "09-30":
+            theo_high2 = min(sum_power(row, 第二次_高峰_9月_cols) / 4, current_cap)
+        elif "10-01" <= md <= "11-30":
+            theo_high2 = min(sum_power(row, 第二次_高峰_10_11月_cols) / 4, current_cap)
+        elif "12-01" <= md <= "12-15":
+            theo_high2 = min(sum_power(row, 第二次_高峰_12月1_15_cols) / 4, current_cap)
+        elif "12-16" <= md <= "12-31":
+            sum1 = sum_power(row, 第二次_高峰_1月_12月16_31_cols_part1)
+            sum2 = sum_power(row, 第二次_高峰_1月_12月16_31_cols_part2)
+            theo_high2 = min((sum1 + sum2) / 4, current_cap)
+        else:
+            theo_high2 = 0.0
+
+        theo_flat_discharge2 = 0.0
+
+        # 第一次实际充放
+        if idx == 0:
+            actual_low1 = min(theo_low1, current_cap)
+            avail_flat_charge1 = current_cap - actual_low1
+            actual_flat_charge1 = min(theo_flat_charge1, avail_flat_charge1)
+            total_charge1 = actual_low1 + actual_flat_charge1
+            discharge_limit1 = min(total_charge1, morning_limit) - system_retain
+            actual_high1 = min(discharge_limit1, theo_high1)
+            remain1 = discharge_limit1 - actual_high1
+            actual_peak1 = min(remain1, theo_peak1)
+            remain1 -= actual_peak1
+            actual_flat_discharge1 = min(remain1, theo_flat_discharge1)
+            total_discharge1 = actual_high1 + actual_peak1 + actual_flat_discharge1
+            cycle1_remain = total_charge1 - total_discharge1
+        else:
+            actual_low1 = min(theo_low1, current_cap - prev_cycle2_remain)
+            avail_flat_charge1 = current_cap - actual_low1 - prev_cycle2_remain
+            actual_flat_charge1 = min(theo_flat_charge1, avail_flat_charge1)
+            total_charge1 = actual_low1 + actual_flat_charge1 + prev_cycle2_remain
+            discharge_limit1 = min(total_charge1, morning_limit) - system_retain
+            actual_high1 = min(discharge_limit1, theo_high1)
+            remain1 = discharge_limit1 - actual_high1
+            actual_peak1 = min(remain1, theo_peak1)
+            remain1 -= actual_peak1
+            actual_flat_discharge1 = min(remain1, theo_flat_discharge1)
+            total_discharge1 = actual_high1 + actual_peak1 + actual_flat_discharge1
+            cycle1_remain = total_charge1 - total_discharge1
+
+        # 第二次实际充放
+        avail_low2 = current_cap - cycle1_remain
+        actual_low2 = min(theo_low2, avail_low2)
+        avail_flat_charge2 = avail_low2 - actual_low2
+        actual_flat_charge2 = min(theo_flat_charge2, avail_flat_charge2)
+        total_charge2 = cycle1_remain + actual_low2 + actual_flat_charge2
+        discharge_limit2 = min(total_charge2, afternoon_limit) - system_retain
+        actual_peak2 = min(discharge_limit2, theo_peak2)
+        remain2 = discharge_limit2 - actual_peak2
+        actual_high2 = min(remain2, theo_high2)
+        actual_flat_discharge2 = 0.0
+        total_discharge2 = actual_peak2 + actual_high2 + actual_flat_discharge2
+        cycle2_remain = total_charge2 - total_discharge2
+        prev_cycle2_remain = cycle2_remain
+
+        # 汇总统计
+        cycle1 = actual_peak1 + actual_high1 + actual_flat_discharge1
+        cycle2 = actual_peak2 + actual_high2 + actual_flat_discharge2
+        total_discharge = cycle1 + cycle2
+        if charge_mode == 2:
+            eq_days = total_discharge / current_cap / 2
+        else:
+            eq_days = total_discharge / current_cap
+        full_days = total_discharge / (initial_capacity * 2)
+        cycle1_ratio = cycle1 / current_cap
+        cycle2_ratio = cycle2 / current_cap
+        low_charge = actual_low1 + actual_low2
+        flat_charge = actual_flat_charge1 + actual_flat_charge2
+        peak_discharge = actual_peak1 + actual_peak2
+        high_discharge = actual_high1 + actual_high2
+        flat_discharge = actual_flat_discharge1 + actual_flat_discharge2
+        theory_total_charge = min(theo_low1 + theo_flat_charge1 + theo_low2 + theo_flat_charge2, current_cap * 2)
+        theory_total_discharge = min(theo_peak1 + theo_high1 + theo_flat_discharge1 + theo_peak2 + theo_high2 + theo_flat_discharge2, current_cap * 2)
+
+        daily_list.append({
+            "日期": date.strftime("%Y-%m-%d"),
+            "月份": month,
+            "充电容量": current_cap,
+            "折算天数": eq_days,
+            "满容量天数": full_days,
+            "低谷充电": low_charge,
+            "平段充电": flat_charge,
+            "尖峰放电": peak_discharge,
+            "高峰放电": high_discharge,
+            "平段放电": flat_discharge,
+            "总放电": total_discharge,
+            "理论总可充电量": theory_total_charge,
+            "理论总可放电量": theory_total_discharge,
+            # 以下字段供详细统计表使用（测试文件中有）
+            "第1次低谷可充电量": theo_low1,
+            "第1次平段可充电量": theo_flat_charge1,
+            "第1次尖峰可放电量": theo_peak1,
+            "第1次高峰可放电量": theo_high1,
+            "第1次平段可放电量": theo_flat_discharge1,
+            "第2次低谷可充电量": theo_low2,
+            "第2次平段可充电量": theo_flat_charge2,
+            "第2次尖峰可放电量": theo_peak2,
+            "第2次高峰可放电量": theo_high2,
+            "第2次平段可放电量": theo_flat_discharge2,
+            "第1次低谷充电量": actual_low1,
+            "第1次平段充电量": actual_flat_charge1,
+            "第1次尖峰放电量": actual_peak1,
+            "第1次高峰放电量": actual_high1,
+            "第1次平段放电量": actual_flat_discharge1,
+            "循环1剩余": cycle1_remain,
+            "第2次低谷充电量": actual_low2,
+            "第2次平段充电量": actual_flat_charge2,
+            "第2次尖峰放电量": actual_peak2,
+            "第2次高峰放电量": actual_high2,
+            "第2次平段放电量": actual_flat_discharge2,
+            "循环2剩余": cycle2_remain,
+            "循环1": cycle1,
+            "循环2": cycle2,
+            "循环1计数": cycle1_ratio,
+            "循环2计数": cycle2_ratio
+        })
+    return daily_list
+
+def aggregate_monthly_for_storage_config(daily_list):
+    month_days_map = {1:31, 2:28, 3:31, 4:30, 5:31, 6:30, 7:31, 8:31, 9:30, 10:31, 11:30, 12:31}
+    month_type_map = {1:"特殊", 2:"正常", 3:"正常", 4:"正常", 5:"正常", 6:"正常", 7:"特殊", 8:"特殊", 9:"正常", 10:"正常", 11:"正常", 12:"特殊"}
+    monthly_agg = {}
+    for d in daily_list:
+        m = d["月份"]
+        if m not in monthly_agg:
+            monthly_agg[m] = {
+                "天数": 0.0,
+                "折算天数": 0.0,
+                "谷充电量": 0.0,
+                "平充电量": 0.0,
+                "尖放电量": 0.0,
+                "峰放电量": 0.0,
+                "平放电量": 0.0,
+                "总放电量": 0.0,
+                "总理论可充电": 0.0,
+                "总理论可放电": 0.0,
+                "总充电容量2倍": 0.0
+            }
+        mon = monthly_agg[m]
+        mon["天数"] += d["满容量天数"]
+        mon["折算天数"] += d["折算天数"]
+        mon["谷充电量"] += d["低谷充电"]
+        mon["平充电量"] += d["平段充电"]
+        mon["尖放电量"] += d["尖峰放电"]
+        mon["峰放电量"] += d["高峰放电"]
+        mon["平放电量"] += d["平段放电"]
+        mon["总放电量"] += d["总放电"]
+        mon["总理论可充电"] += d["理论总可充电量"]
+        mon["总理论可放电"] += d["理论总可放电量"]
+        mon["总充电容量2倍"] += d["充电容量"] * 2
+
+    monthly_list = []
+    peak_discharge_ratios = []
+    high_discharge_ratios = []
+    flat_discharge_ratios = []
+
+    for m in range(1, 13):
+        if m in monthly_agg:
+            d = monthly_agg[m]
+            total_charge = d["谷充电量"] + d["平充电量"]
+            total_discharge = d["总放电量"]
+            ratio_charge = d["总理论可充电"] / d["总充电容量2倍"] if d["总充电容量2倍"] else 0
+            ratio_discharge = d["总理论可放电"] / d["总充电容量2倍"] if d["总充电容量2倍"] else 0
+            combined = min(ratio_charge, ratio_discharge)
+            diff = ratio_charge - ratio_discharge
+            if diff >= 0.05:
+                text = "消纳不足"
+            elif diff <= -0.05:
+                text = "充电不足"
+            else:
+                text = "充放平衡"
+
+            month_peak_ratio = d["尖放电量"] / total_discharge if total_discharge else 0
+            month_high_ratio = d["峰放电量"] / total_discharge if total_discharge else 0
+            month_flat_ratio = d["平放电量"] / total_discharge if total_discharge else 0
+
+            month_dict = {
+                "月份": m,
+                "分类": month_type_map[m],
+                "天数": round(d["天数"], 2),
+                "折算天数": round(d["折算天数"], 2),
+                "谷充电量(度)": round(d["谷充电量"], 2),
+                "平充电量(度)": round(d["平充电量"], 2),
+                "总充电量(度)": round(total_charge, 2),
+                "尖放电量(度)": round(d["尖放电量"], 2),
+                "峰放电量(度)": round(d["峰放电量"], 2),
+                "平放电量(度)": round(d["平放电量"], 2),
+                "总放电量(度)": round(total_discharge, 2),
+                "谷充电占比": round(d["谷充电量"] / total_charge if total_charge else 0, 4),
+                "平充电占比": round(d["平充电量"] / total_charge if total_charge else 0, 4),
+                "尖放电占比": round(month_peak_ratio, 4),
+                "峰放电占比": round(month_high_ratio, 4),
+                "平放电占比": round(month_flat_ratio, 4),
+                "每月天数": month_days_map[m],
+                "理论可充电情况": round(ratio_charge, 4),
+                "理论可放电情况": round(ratio_discharge, 4),
+                "综合充放电数值": round(combined, 4),
+                "综合充放电文本": text
+            }
+            monthly_list.append(month_dict)
+            peak_discharge_ratios.append(month_dict["尖放电占比"])
+            high_discharge_ratios.append(month_dict["峰放电占比"])
+            flat_discharge_ratios.append(month_dict["平放电占比"])
+        else:
+            month_dict = {
+                "月份": m,
+                "分类": month_type_map[m],
+                "天数": 0.0,
+                "折算天数": 0.0,
+                "谷充电量(度)": 0.0,
+                "平充电量(度)": 0.0,
+                "总充电量(度)": 0.0,
+                "尖放电量(度)": 0.0,
+                "峰放电量(度)": 0.0,
+                "平放电量(度)": 0.0,
+                "总放电量(度)": 0.0,
+                "谷充电占比": 0.0,
+                "平充电占比": 0.0,
+                "尖放电占比": 0.0,
+                "峰放电占比": 0.0,
+                "平放电占比": 0.0,
+                "每月天数": month_days_map[m],
+                "理论可充电情况": 0.0,
+                "理论可放电情况": 0.0,
+                "综合充放电数值": 0.0,
+                "综合充放电文本": "无数据"
+            }
+            monthly_list.append(month_dict)
+            peak_discharge_ratios.append(0.0)
+            high_discharge_ratios.append(0.0)
+            flat_discharge_ratios.append(0.0)
+
+    total_days = sum(m["天数"] for m in monthly_list)
+    total_eq = sum(m["折算天数"] for m in monthly_list)
+    total_days = max(total_days, 0)
+    total_eq = max(total_eq, 0)
+    total_low = sum(m["谷充电量(度)"] for m in monthly_list)
+    total_flat_charge = sum(m["平充电量(度)"] for m in monthly_list)
+    total_peak = sum(m["尖放电量(度)"] for m in monthly_list)
+    total_high = sum(m["峰放电量(度)"] for m in monthly_list)
+    total_flat_discharge = sum(m["平放电量(度)"] for m in monthly_list)
+    total_charge = sum(m["总充电量(度)"] for m in monthly_list)
+    total_discharge = sum(m["总放电量(度)"] for m in monthly_list)
+    total_charge_ratio = total_charge / (total_eq * 2) if total_eq else 0
+    total_discharge_ratio = total_discharge / (total_eq * 2) if total_eq else 0
+    total_combined = min(total_charge_ratio, total_discharge_ratio)
+    total_low_charge_ratio = total_low / total_charge if total_charge else 0
+    total_flat_charge_ratio = total_flat_charge / total_charge if total_charge else 0
+
+    monthly_list.append({
+        "月份": "总计",
+        "分类": "",
+        "天数": round(total_days, 2),
+        "折算天数": round(total_eq, 2),
+        "谷充电量(度)": round(total_low, 2),
+        "平充电量(度)": round(total_flat_charge, 2),
+        "总充电量(度)": round(total_charge, 2),
+        "尖放电量(度)": round(total_peak, 2),
+        "峰放电量(度)": round(total_high, 2),
+        "平放电量(度)": round(total_flat_discharge, 2),
+        "总放电量(度)": round(total_discharge, 2),
+        "谷充电占比": round(total_low_charge_ratio, 4),
+        "平充电占比": round(total_flat_charge_ratio, 4),
+        "尖放电占比": round(sum(peak_discharge_ratios) / 12, 4),
+        "峰放电占比": round(sum(high_discharge_ratios) / 12, 4),
+        "平放电占比": round(sum(flat_discharge_ratios) / 12, 4),
+        "每月天数": 365,
+        "理论可充电情况": round(total_charge_ratio, 4),
+        "理论可放电情况": round(total_discharge_ratio, 4),
+        "综合充放电数值": round(total_combined, 4),
+        "综合充放电文本": ""
+    })
+    return monthly_list
+
+def generate_payback_table_data(run_days, discharge_tax, charge_tax, total_rated, total_actual, unit_count,
+                                 device_cost, construction_cost, discount_rate, brokerage_rate,
+                                 system_efficiency_payback, operation_cost_rate, tax_rate, interest_rate,
+                                 per_unit=True):
+    """
+    生成投资回收期表数据（与浙江版本一致，仅调用方式保留）
+    """
+    total_device_cost = device_cost * unit_count
+    total_construction_cost = construction_cost * unit_count
+    discharge_emic = discharge_tax
+    charge_emic = charge_tax
+    edingdianliang = total_rated
+    chunengdianliang = total_actual
+    taishu = 1
+    low_pressure_default_cost = total_device_cost
+    construction_default_cost = total_construction_cost
+    suodeshui = tax_rate
+    dianjiazhekou = discount_rate
+    nianlixi = interest_rate
+    baoxianbili = 0.0015
+    fangdianshendu = 1
+    xitongxiaolv = system_efficiency_payback
+    xiaoxiangshuilv = 0.13
+    JUJIAN = brokerage_rate
+    unit_om_cost = operation_cost_rate
+    di9diya = low_pressure_default_cost * taishu
+    di9shigong = construction_default_cost * taishu
+    di1diya = di9diya / edingdianliang * 10
+    di1shigong = di9shigong / edingdianliang * 10
+    invest_yr9 = round(0.4 * edingdianliang / 10 / 1.13, 4)
+    invest_tax_yr1 = (di1diya * edingdianliang / 10) + (di1shigong * edingdianliang / 10) + (JUJIAN * edingdianliang / 10)
+    invest_no_tax_yr1 = (di1diya * edingdianliang / 10 / 1.13) + (di1shigong * edingdianliang / 10) + (JUJIAN * edingdianliang / 10)
+    input_tax = round(invest_tax_yr1 - invest_no_tax_yr1, 4)
+    jujian_yr9 = [0.0] * 17
+    jujian_yr9[0] = round(edingdianliang * JUJIAN / 10, 4)
+    power_station_invest = [0.0] * 17
+    power_station_invest[0] = round(edingdianliang * di1diya / 10, 4)
+    power_station_invest[8] = round(invest_yr9 * 1.13, 4)
+    construction_invest = [0.0] * 17
+    construction_invest[0] = di9shigong
+    battery_ratio = [0.0, 0.965, 0.911, 0.877, 0.848, 0.823, 0.800, 0.778, 0.758,
+                 0.965, 0.911, 0.877, 0.848, 0.823, 0.800, 0.778, 0.758]
+    battery_percent = [f"{v*100:.1f}%" if v !=0 else "0.0%" for v in battery_ratio]
+    charge_kwh = [0.0] * 17
+    for n in range(1, 17):
+        charge_kwh[n] = round((run_days * chunengdianliang * fangdianshendu)*2 / 10000 /
+                              (1 - (1 - xitongxiaolv)/2) * battery_ratio[n], 2)
+    discharge_kwh = [0.0] * 17
+    for n in range(1, 17):
+        discharge_kwh[n] = round(xitongxiaolv * charge_kwh[n], 2)
+    cash_in = [0.0] * 17
+    for n in range(1, 17):
+        cash_in[n] = round((discharge_kwh[n] * discharge_emic - charge_kwh[n] * charge_emic) * dianjiazhekou, 2)
+    electricity_income = cash_in.copy()
+    operation_cost = [0.0] * 17
+    for n in range(1, 17):
+        operation_cost[n] = round(unit_om_cost * 20 * unit_count, 2)
+    insurance_cost = [0.0] * 17
+    for n in range(1, 17):
+        insurance_cost[n] = round(invest_no_tax_yr1 * baoxianbili, 4)
+    output_tax = [0.0] * 17
+    for n in range(1, 17):
+        output_tax[n] = round(cash_in[n] - cash_in[n]/(1 + xiaoxiangshuilv), 4)
+    vat_tax = [0.0] * 17
+    vat_tax[0] = round(output_tax[0] - input_tax, 4)
+    for n in range(1, 17):
+        vat_tax[n] = round(output_tax[n], 4)
+    pay_vat = [0.0] * 17
+    for n in range(1, 17):
+        sum_vat = sum(vat_tax[:n+1])
+        sum_pay_before = sum(pay_vat[:n])
+        if sum_vat > 0 and sum_pay_before == 0:
+            pay_vat[n] = round(sum_vat, 4)
+        elif sum_vat > 0 and sum_pay_before > 0:
+            pay_vat[n] = round(vat_tax[n], 4)
+        else:
+            pay_vat[n] = 0.0
+    tax_surcharge = [0.0] * 17
+    for n in range(1, 17):
+        tax_surcharge[n] = round(cash_in[n] * 3/10000 + pay_vat[n] * 0.12, 4)
+    depreciation = [0.0] * 17
+    depr_yr1_8 = round(invest_no_tax_yr1 * 0.95 / 8, 4)
+    depr_yr9_16 = round(power_station_invest[8] * 0.95 / (1.13 * 8), 4)
+    for n in range(1, 17):
+        if 1 <= n <= 8:
+            depreciation[n] = depr_yr1_8
+        elif 9 <= n <= 16:
+            depreciation[n] = depr_yr9_16
+    excel_cash_out = [0.0] * 17
+    excel_net_cash_flow = [0.0] * 17
+    excel_cum_cash_flow = [0.0] * 17
+    excel_interest = [0.0] * 17
+    excel_income_tax = [0.0] * 17
+    excel_cash_out[0] = round(di9diya + di9shigong + jujian_yr9[0], 4)
+    excel_net_cash_flow[0] = round(-excel_cash_out[0], 4)
+    excel_cum_cash_flow[0] = excel_net_cash_flow[0]
+    for n in range(1, 17):
+        if excel_cum_cash_flow[n-1] < 0:
+            excel_interest[n] = round(abs(excel_cum_cash_flow[n-1]) * nianlixi, 4)
+        else:
+            excel_interest[n] = 0.0
+        taxable_base = (
+            electricity_income[n] - operation_cost[n] - insurance_cost[n]
+            - tax_surcharge[n] - excel_interest[n] - depreciation[n] - output_tax[n]
+        )
+        excel_income_tax[n] = round(taxable_base * suodeshui, 4) 
+        excel_cash_out[n] = round(
+            power_station_invest[n] + jujian_yr9[n] + operation_cost[n] + insurance_cost[n]
+            + tax_surcharge[n] + excel_interest[n] + excel_income_tax[n] + pay_vat[n],
+            4
+        )
+        excel_net_cash_flow[n] = round(cash_in[n] - excel_cash_out[n], 4)
+        excel_cum_cash_flow[n] = round(excel_cum_cash_flow[n-1] + excel_net_cash_flow[n], 4)
+
+    project_pre_tax_profit = [0.0] * 17
+    project_pre_tax_profit[0] = 0.0
+    for n in range(1, 17):
+        project_pre_tax_profit[n] = round(
+            electricity_income[n] - operation_cost[n] - insurance_cost[n]
+            - tax_surcharge[n] - excel_interest[n] - depreciation[n] - output_tax[n],
+            2
+        )
+
+    judge_vat = [0.0] * 17
+    for n in range(17):
+        if pay_vat[n] <= 0:
+            judge_vat[n] = 0.0
+        else:
+            judge_vat[n] = pay_vat[n]
+
+    indirect_cum_cash_flow = [0.0] * 17
+    indirect_cum_cash_flow[0] = excel_cum_cash_flow[0]
+    for n in range(1, 17):
+        indirect_cum_cash_flow[n] = round(
+            depreciation[n] + project_pre_tax_profit[n] + indirect_cum_cash_flow[n-1]
+            + output_tax[n] - excel_income_tax[n] - judge_vat[n],
+            4
+        )
+
+    payback_yearly = [0.0] * 17
+    final_payback_text = "全周期无法回收投资"
+    break_even_year = None
+    for year_idx in range(17):
+        if indirect_cum_cash_flow[year_idx] >= 0:
+            break_even_year = year_idx
+            break
+    actual_final = 0.0
+    if break_even_year is not None:
+        if break_even_year == 0:
+            actual_final = 0.0
+            final_payback_text = "0.00年（已回收）"
+            for year_idx in range(17):
+                payback_yearly[year_idx] = "0.00年（已回收）"
+        else:
+            m = break_even_year - 1
+            numerator = abs(indirect_cum_cash_flow[m])
+            denominator = indirect_cum_cash_flow[m+1] - indirect_cum_cash_flow[m]
+            if denominator != 0:
+                calculated_pb_value = numerator / denominator
+                actual_final = round(m + calculated_pb_value, 2)
+                final_payback_text = f"{actual_final:.2f}年（已回收）"
+            else:
+                actual_final = round(m, 2)
+                final_payback_text = f"{actual_final:.2f}年（已回收）"
+            for year_idx in range(17):
+                if year_idx < break_even_year:
+                    if year_idx < 16:
+                        curr_cum = indirect_cum_cash_flow[year_idx]
+                        next_cum = indirect_cum_cash_flow[year_idx+1]
+                        if next_cum - curr_cum != 0:
+                            dynamic_pb = abs(curr_cum) / (next_cum - curr_cum)
+                            payback_yearly[year_idx] = f"{dynamic_pb:.2f}年（预测）"
+                        else:
+                            payback_yearly[year_idx] = "未回收"
+                    else:
+                        payback_yearly[year_idx] = "未回收"
+                else:
+                    payback_yearly[year_idx] = final_payback_text
+    else:
+        for year_idx in range(17):
+            payback_yearly[year_idx] = "未回收"
+
+    recovery_actual_str_list = []
+    for year_idx in range(17):
+        if indirect_cum_cash_flow[year_idx] >= 0 and year_idx > 0:
+            m = year_idx - 1
+            if indirect_cum_cash_flow[year_idx] - indirect_cum_cash_flow[m] != 0:
+                pb_val_interp = m + abs(indirect_cum_cash_flow[m]) / (indirect_cum_cash_flow[year_idx] - indirect_cum_cash_flow[m])
+                recovery_actual_str_list.append(f"{pb_val_interp:.2f}")
+            else:
+                recovery_actual_str_list.append("无法计算")
+        elif year_idx == 0 and indirect_cum_cash_flow[year_idx] >= 0:
+            recovery_actual_str_list.append("0.00")
+        else:
+            recovery_actual_str_list.append(" ")
+    while len(recovery_actual_str_list) < 17:
+        recovery_actual_str_list.append(" ")
+
+    year_headers = ['项目'] + [f'第{i}年' for i in range(0,17)] + ['合计']
+    data = [
+        ['电池容量', *battery_percent, '-'],
+        ['充电量（万度）', *charge_kwh, round(sum(charge_kwh), 4)],
+        ['放电量（万度）', *discharge_kwh, round(sum(discharge_kwh), 4)],
+        ['现金流入（电费收入）', *cash_in, round(sum(cash_in), 4)],
+        ['电费收入', *electricity_income, round(sum(electricity_income), 4)],
+        ['现金流出', *excel_cash_out, round(sum(excel_cash_out), 4)],
+        ['电站投资', *power_station_invest, round(sum(power_station_invest), 4)],
+        ['施工', *construction_invest, round(sum(construction_invest), 4)],
+        ['第9年居间', *jujian_yr9, round(sum(jujian_yr9), 4)],
+        ['运营成本', *operation_cost, round(sum(operation_cost), 4)],
+        ['保险费用', *insurance_cost, round(sum(insurance_cost), 4)],
+        ['税金及附加', *tax_surcharge, round(sum(tax_surcharge), 4)],
+        ['利息', *excel_interest, round(sum(excel_interest), 4)],
+        ['税费（所得税，非绝对值）', *excel_income_tax, round(sum(excel_income_tax), 4)],
+        ['支付增值税', *pay_vat, round(sum(pay_vat), 4)],
+        ['现金净流入', *excel_net_cash_flow, round(sum(excel_net_cash_flow), 4)],
+        ['累计现金流量', *excel_cum_cash_flow, round(excel_cum_cash_flow[-1], 4)],
+        ['项目折旧', *depreciation, round(sum(depreciation), 4)],
+        ['增值税', *vat_tax, round(sum(vat_tax), 4)],
+        ['销项税', *output_tax, round(sum(output_tax), 4)],
+        ['项目税前利润', *project_pre_tax_profit, round(sum(project_pre_tax_profit), 2)],
+        ['判断', *judge_vat, round(sum(judge_vat), 4)],
+        ['间接法累计现金流', *indirect_cum_cash_flow, round(indirect_cum_cash_flow[-1], 4)],
+        ['静态投资回收期', *payback_yearly, final_payback_text],
+        ['回收周期实测', *recovery_actual_str_list, f"{actual_final:.2f}" if actual_final is not None else "无法回收"],
+    ]
+    return year_headers, data
+
+def generate_profit_calculation_data(run_days, discharge_tax, charge_tax, total_rated, total_actual, unit_count,
+                                      device_cost, construction_cost, discount_rate,
+                                      system_efficiency_payback, operation_cost_rate, tax_rate, interest_rate,
+                                      per_unit=True):
+    """收益测算表（保持不变）"""
+    profit_efficiency = 0.885
+    discharge_tax_val = discharge_tax
+    charge_tax_val = charge_tax
+    cost_per_kwh = 1.05
+    initial_invest_excl = total_rated * cost_per_kwh / 10 / 1.13
+    initial_invest_tax = initial_invest_excl * 1.13
+    run_days_val = run_days
+    om_cost_rate = operation_cost_rate
+    tax_rate_val = tax_rate
+    interest_rate_val = interest_rate
+    emc_discount = discount_rate
+    battery_cap = [0.965, 0.911, 0.877, 0.848, 0.823, 0.800, 0.778, 0.758,
+                   0.965, 0.911, 0.877, 0.848, 0.823, 0.800, 0.778, 0.758]
+    years = list(range(1, 17))
+    epc_charge_vols = []
+    epc_discharge_vols = []
+    epc_incomes = []
+    epc_costs = []
+    epc_om_costs = []
+    epc_profits = []
+    epc_rois = []
+    epc_npvs = []
+    npv_accum = 0
+    for i in range(16):
+        charge_vol = total_actual * run_days_val / 10000 * 2 * battery_cap[i] / (1 - (0.5 - profit_efficiency/2))
+        discharge_vol = charge_vol * profit_efficiency
+        income = discharge_tax_val * discharge_vol
+        cost_charge = charge_tax_val * charge_vol
+        om_cost = 0 if i < 2 else unit_count * om_cost_rate * 20
+        profit_tax = income - cost_charge - om_cost
+        roi = profit_tax / initial_invest_tax if initial_invest_tax != 0 else 0
+        if i == 0:
+            npv = profit_tax - initial_invest_tax
+        else:
+            npv = npv_accum + profit_tax
+        npv_accum = npv
+        epc_charge_vols.append(charge_vol)
+        epc_discharge_vols.append(discharge_vol)
+        epc_incomes.append(income)
+        epc_costs.append(cost_charge)
+        epc_om_costs.append(om_cost)
+        epc_profits.append(profit_tax)
+        epc_rois.append(roi)
+        epc_npvs.append(npv)
+    emc_owner_profits = []
+    for i in range(16):
+        charge_vol = total_actual * run_days_val / 10000 * 2 * battery_cap[i] / (1 - (0.5 - profit_efficiency/2))
+        discharge_vol = charge_vol * profit_efficiency
+        owner_profit = (discharge_vol * discharge_tax_val - charge_vol * charge_tax_val) * (1 - emc_discount)
+        emc_owner_profits.append(owner_profit)
+    cum_10 = sum(emc_owner_profits[:10])
+    cum_12 = sum(emc_owner_profits[:12])
+    cum_15 = sum(emc_owner_profits[:15])
+    cum_16 = sum(emc_owner_profits[:16])
+    payback_period = ""
+    break_even_year = None
+    for i, npv_val in enumerate(epc_npvs):
+        if npv_val >= 0:
+            break_even_year = i
+            break
+    if break_even_year is not None:
+        if break_even_year == 0:
+            payback_period = "0.00年"
+        else:
+            m = break_even_year - 1
+            numerator = abs(epc_npvs[m])
+            denominator = epc_profits[break_even_year]
+            if denominator != 0:
+                payback_fraction = numerator / denominator
+                payback = m + payback_fraction
+                payback_period = f"{payback:.2f}年"
+            else:
+                payback_period = f"{break_even_year}.00年"
+    else:
+        payback_period = "未回收"
+    csv_buffer = StringIO()
+    writer = csv.writer(csv_buffer, quoting=csv.QUOTE_MINIMAL)
+    writer.writerow(["含税放电", "含税充电", "不含税放电", "不含税充电", "投资度数", "实际度数", "台数", "成本",
+                     "运行天数", "收益效率", "备注", "初始投资含税", "EPC16年含税收益",
+                     "EPC投资回收周期", "运维成本", "所得税", "利息", "EMC折扣"])
+    epc_16year_total_profit = sum(epc_profits)
+    top_values = [
+        discharge_tax_val, charge_tax_val, discharge_tax_val / 1.13, charge_tax_val / 1.13,
+        total_rated, total_actual, unit_count, cost_per_kwh, run_days_val, profit_efficiency,
+        "第1、2年免运维费用", initial_invest_tax, epc_16year_total_profit,
+        payback_period, f"{operation_cost_rate*100}%", f"{tax_rate_val*100}%",
+        f"{interest_rate_val*100}%", emc_discount
+    ]
+    writer.writerow(top_values)
+    writer.writerow(["初始投资不含税", initial_invest_excl])
+    writer.writerow([])
+    writer.writerow(["EPC模式业主投资回收期"])
+    writer.writerow(["年限"] + [str(y) for y in years])
+    epc_rows = [
+        ("储能容量(kwh)", [total_rated] * 16),
+        ("年运行天数(天)", [run_days_val] * 16),
+        ("收益效率", [profit_efficiency] * 16),
+        ("放电电价(元/kwh)", [discharge_tax_val] * 16),
+        ("充电电价(元/kwh)", [charge_tax_val] * 16),
+        ("电池容量", battery_cap),
+        ("充电量(万度)", epc_charge_vols),
+        ("放电量(万度)", epc_discharge_vols),
+        ("发电收入(万元)", epc_incomes),
+        ("购电成本(万元)", epc_costs),
+        ("运维成本(万元)", epc_om_costs),
+        ("含税收益(万元)", epc_profits),
+        ("ROI", epc_rois),
+        ("净现值(万元)", epc_npvs)
+    ]
+    for name, values in epc_rows:
+        writer.writerow([name] + [round(v, 4) if isinstance(v, float) else v for v in values])
+    writer.writerow([])
+    writer.writerow(["EMC模式业主收益情况"])
+    writer.writerow(["年限"] + [str(y) for y in years] + ["10年累计", "12年累计", "15年累计", "16年累计"])
+    emc_rows = [
+        ("储能容量(kwh)", [total_rated] * 16),
+        ("年运行天数(天)", [run_days_val] * 16),
+        ("收益效率", [profit_efficiency] * 16),
+        ("放电电价(元/kwh)", [discharge_tax_val] * 16),
+        ("充电电价(元/kwh)", [charge_tax_val] * 16),
+        ("电价折扣", [emc_discount] * 16),
+        ("储能分成", [1 - emc_discount] * 16),
+        ("电池容量", battery_cap),
+        ("充电度数(万度)", epc_charge_vols),
+        ("放电度数(万度)", epc_discharge_vols),
+        ("业主含税收益(万元)", emc_owner_profits)
+    ]
+    for name, values in emc_rows:
+        row = [name] + [round(v, 4) if isinstance(v, float) else v for v in values]
+        if name == "业主含税收益(万元)":
+            row += [round(cum_10, 4), round(cum_12, 4), round(cum_15, 4), round(cum_16, 4)]
+        else:
+            row += [""] * 4
+        writer.writerow(row)
+    writer.writerow(["累计收益"] + [""] * 16 + [round(cum_10, 4), round(cum_12, 4), round(cum_15, 4), round(cum_16, 4)])
+    return csv_buffer.getvalue()
+
+def to_csv_string(rows, headers):
+    output = StringIO()
+    writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
+    writer.writerow(headers)
+    writer.writerows(rows)
+    return output.getvalue()
+
+# ====================== 主入口函数 ======================
+def main(**kwargs):
+    file_text = safe_str(kwargs.get("file_text", ""))
+    if not file_text:
+        return {
+            "error": "输入文件内容为空",
+            "pivot_base64": "",
+            "power_matrix_base64": "",
+            "stats_base64": "",
+            "storage_config_base64": "",
+            "payback_base64": "",
+            "profit_calculation_base64": ""
+        }
+    output_detail = safe_int(kwargs.get("output_detail"), 0) == 1
+    per_unit = safe_int(kwargs.get("per_unit"), 1) == 1
+    unit_count = safe_int(kwargs.get("unit_count"), 2)
+    device_model = safe_str(kwargs.get("device_model"), "S1")
+    charge_mode = safe_int(kwargs.get("charge_mode"), 2)
+    discharge_tax_backup = safe_float(kwargs.get("discharge_tax"), 0.9176)
+    charge_tax_backup = safe_float(kwargs.get("charge_tax"), 0.3466)
+    safety_factor = safe_float(kwargs.get("safety_factor"), 0.85)
+    transformer_capacity = safe_float(kwargs.get("transformer_capacity_kVA"), 400)
+    discount_rate = safe_float(kwargs.get("discount_rate"), 0.85)
+    brokerage_rate = safe_float(kwargs.get("brokerage_rate"), 0.05)
+    morning_limit_ratio = safe_float(kwargs.get("morning_discharge_limit_ratio"), 0.5)
+    afternoon_limit_ratio = safe_float(kwargs.get("afternoon_discharge_limit"), 1.0)
+    annual_decay_rate = safe_float(kwargs.get("annual_decay_rate"), 0.025)
+    system_efficiency_payback = safe_float(kwargs.get("system_efficiency_payback"), 0.865)
+    operation_cost_rate = safe_float(kwargs.get("operation_cost_rate"), 0.01)
+    tax_rate = safe_float(kwargs.get("tax_rate"), 0.05)
+    interest_rate = safe_float(kwargs.get("interest_rate"), 0.04)
+    afternoon_charge_ratio = 0.0
+
+    device_specs = {
+        "S1": {1: (50, 225, 235, 11.6, 3.5), 2: (100, 225, 235, 11.6, 4.0)},
+        "S2": {1: (65, 261, 271, 14.0, 3.5), 2: (130, 261, 271, 14.0, 3.915)},
+        "X3": {1: (215, 836, 876, 44.308, 0.0), 2: (418, 836, 876, 44.308, 0.0)}
+    }
+    if device_model not in device_specs or charge_mode not in device_specs[device_model]:
+        raise ValueError(f"无效的设备组合: {device_model}, 模式 {charge_mode}")
+    power_per_unit, rated_per_unit, actual_per_unit, device_cost, construction_cost = device_specs[device_model][charge_mode]
+    total_power = power_per_unit * unit_count
+    total_rated = rated_per_unit * unit_count
+    total_actual = actual_per_unit * unit_count
+    power_limit = safety_factor * transformer_capacity
+    daily_decay = annual_decay_rate / 365
+
+    dates, times, date_power, info = parse_data_text(file_text)
+    if not dates:
+        return {
+            "error": f"无法解析数据: {info}",
+            "pivot_base64": "",
+            "power_matrix_base64": "",
+            "stats_base64": "",
+            "storage_config_base64": "",
+            "payback_base64": "",
+            "profit_calculation_base64": ""
+        }
+    pivot_data, times = pivot(dates, times, date_power)
+
+    new_df, formula_map, _ = build_power_matrix(pivot_data, times, total_power, power_limit, afternoon_charge_ratio)
+    detailed_stats = calc_detailed_stats(new_df, times, total_actual, morning_limit_ratio, afternoon_limit_ratio,
+                                          afternoon_charge_ratio, charge_mode, daily_decay)
+
+    monthly_config = aggregate_monthly_for_storage_config(detailed_stats)
+
+    AVG_PRICE_PEAK = 1.3252
+    AVG_PRICE_HIGH = 1.0915
+    AVG_PRICE_FLAT = 0.6499
+    AVG_PRICE_LOW = 0.3128
+
+    discharge_tax = discharge_tax_backup
+    charge_tax = charge_tax_backup
+    total_row = monthly_config[-1] if monthly_config else None
+    if total_row and total_row["月份"] == "总计":
+        peak_discharge_ratio = total_row.get("尖放电占比", 0.0)
+        high_discharge_ratio = total_row.get("峰放电占比", 0.0)
+        flat_discharge_ratio = total_row.get("平放电占比", 0.0)
+        low_charge_ratio = total_row.get("谷充电占比", 0.0)
+        flat_charge_ratio = total_row.get("平充电占比", 0.0)
+        discharge_tax = (AVG_PRICE_PEAK * peak_discharge_ratio +
+                         AVG_PRICE_HIGH * high_discharge_ratio +
+                         AVG_PRICE_FLAT * flat_discharge_ratio)
+        charge_tax = (AVG_PRICE_LOW * low_charge_ratio +
+                      AVG_PRICE_FLAT * flat_charge_ratio)
+
+    total_eq_days = monthly_config[-1]["折算天数"] if monthly_config else 0.0
+
+    # 生成原始透视表
+    morning_peak_times = ["09:00:00", "09:15:00", "09:30:00", "09:45:00",
+                          "10:00:00", "10:15:00", "10:30:00", "10:45:00"]
+    afternoon_peak_times = ["15:00:00", "15:15:00", "15:30:00", "15:45:00",
+                            "16:00:00", "16:15:00", "16:30:00", "16:45:00"]
+    time_to_idx = {t: i for i, t in enumerate(times)}
+    morning_indices = [time_to_idx[t] for t in morning_peak_times if t in time_to_idx]
+    afternoon_indices = [time_to_idx[t] for t in afternoon_peak_times if t in time_to_idx]
+    extra_headers = ["最大需量（日）", "充电保护值", "尖最小功率", "1充放电容量（上午）", "1充放电容量（下午）", "充电容量", "系统留存"]
+    initial_capacity = total_actual
+    daily_capacities = []
+    for idx in range(len(pivot_data)):
+        current_cap = initial_capacity - daily_decay * initial_capacity * idx
+        daily_capacities.append(current_cap)
+    pivot_rows = []
+    for row in pivot_data:
+        date_str = row[0].strftime("%Y-%m-%d")
+        power_vals = row[1:]
+        pivot_rows.append([date_str] + power_vals)
+    pivot_rows_with_extra = []
+    for idx, row in enumerate(pivot_rows):
+        date_str = row[0]
+        power_vals = row[1:]
+        max_demand = max(power_vals) if power_vals else 0.0
+        morning_min = min([power_vals[i] for i in morning_indices]) if morning_indices else float('inf')
+        afternoon_min = min([power_vals[i] for i in afternoon_indices]) if afternoon_indices else float('inf')
+        peak_min = min(morning_min, afternoon_min) if (morning_indices and afternoon_indices) else 0.0
+        charge_cap = daily_capacities[idx]
+        morning_limit = charge_cap * morning_limit_ratio
+        afternoon_limit = charge_cap * afternoon_limit_ratio
+        extra_vals = [
+            round(max_demand, 2),
+            round(power_limit, 2),
+            round(peak_min, 2),
+            round(morning_limit, 2),
+            round(afternoon_limit, 2),
+            round(charge_cap, 2),
+            0.0
+        ]
+        pivot_rows_with_extra.append(row + extra_vals)
+    pivot_headers = ["日期"] + times + extra_headers
+    pivot_csv = to_csv_string(pivot_rows_with_extra, pivot_headers)
+    pivot_base64 = base64.b64encode(pivot_csv.encode('utf-8')).decode('utf-8') if output_detail else ""
+
+    # 充放电功率矩阵
+    power_matrix_rows = []
+    for row in new_df:
+        date_str = row["日期"].strftime("%Y-%m-%d")
+        power_vals = [row[t] for t in times]
+        power_matrix_rows.append([date_str] + power_vals)
+    power_matrix_headers = ["日期"] + times
+    power_matrix_csv = to_csv_string(power_matrix_rows, power_matrix_headers)
+    power_matrix_base64 = base64.b64encode(power_matrix_csv.encode('utf-8')).decode('utf-8') if output_detail else ""
+
+    # 详细统计表
+    stats_headers = [
+        "日期", "月份",
+        "第1次低谷可充电量", "第1次平段可充电量", "第1次尖峰可放电量", "第1次高峰可放电量", "第1次平段可放电量",
+        "第2次低谷可充电量", "第2次平段可充电量", "第2次尖峰可放电量", "第2次高峰可放电量", "第2次平段可放电量",
+        "理论总可充电量", "理论总可放电量",
+        "第1次低谷充电量", "第1次平段充电量", "第1次尖峰放电量", "第1次高峰放电量", "第1次平段放电量", "循环1剩余",
+        "第2次低谷充电量", "第2次平段充电量", "第2次尖峰放电量", "第2次高峰放电量", "第2次平段放电量", "循环2剩余",
+        "循环1", "循环2", "折算天数", "循环1计数", "循环2计数",
+        "低谷充电", "平段充电", "尖峰放电", "高峰放电", "平段放电", "总放电", "满容量天数"
+    ]
+    stats_rows = []
+    for d in detailed_stats:
+        row = [
+            d.get("日期", ""), d.get("月份", 0),
+            d.get("第1次低谷可充电量", 0.0), d.get("第1次平段可充电量", 0.0),
+            d.get("第1次尖峰可放电量", 0.0), d.get("第1次高峰可放电量", 0.0), d.get("第1次平段可放电量", 0.0),
+            d.get("第2次低谷可充电量", 0.0), d.get("第2次平段可充电量", 0.0),
+            d.get("第2次尖峰可放电量", 0.0), d.get("第2次高峰可放电量", 0.0), d.get("第2次平段可放电量", 0.0),
+            d.get("理论总可充电量", 0.0), d.get("理论总可放电量", 0.0),
+            d.get("第1次低谷充电量", 0.0), d.get("第1次平段充电量", 0.0),
+            d.get("第1次尖峰放电量", 0.0), d.get("第1次高峰放电量", 0.0), d.get("第1次平段放电量", 0.0),
+            d.get("循环1剩余", 0.0),
+            d.get("第2次低谷充电量", 0.0), d.get("第2次平段充电量", 0.0),
+            d.get("第2次尖峰放电量", 0.0), d.get("第2次高峰放电量", 0.0), d.get("第2次平段放电量", 0.0),
+            d.get("循环2剩余", 0.0),
+            d.get("循环1", 0.0), d.get("循环2", 0.0), d.get("折算天数", 0.0),
+            d.get("循环1计数", 0.0), d.get("循环2计数", 0.0),
+            d.get("低谷充电", 0.0), d.get("平段充电", 0.0), d.get("尖峰放电", 0.0),
+            d.get("高峰放电", 0.0), d.get("平段放电", 0.0), d.get("总放电", 0.0), d.get("满容量天数", 0.0)
+        ]
+        row = [round(v, 4) if isinstance(v, float) else v for v in row]
+        stats_rows.append(row)
+    stats_csv = to_csv_string(stats_rows, stats_headers)
+    stats_base64 = base64.b64encode(stats_csv.encode('utf-8')).decode('utf-8')
+
+    # 容量-储能配置表
+    monthly_headers = [
+        "月份", "分类", "天数", "折算天数", "谷充电量(度)", "平充电量(度)", "总充电量(度)",
+        "尖放电量(度)", "峰放电量(度)", "平放电量(度)", "总放电量(度)",
+        "谷充电占比", "平充电占比", "尖放电占比", "峰放电占比", "平放电占比",
+        "每月天数", "理论可充电情况", "理论可放电情况", "综合充放电数值", "综合充放电文本"
+    ]
+    monthly_rows = []
+    for m in monthly_config:
+        row = [
+            m["月份"], m["分类"], m["天数"], m["折算天数"], m["谷充电量(度)"], m["平充电量(度)"], m["总充电量(度)"],
+            m["尖放电量(度)"], m["峰放电量(度)"], m["平放电量(度)"], m["总放电量(度)"],
+            m["谷充电占比"], m["平充电占比"], m["尖放电占比"], m["峰放电占比"], m["平放电占比"],
+            m["每月天数"], m["理论可充电情况"], m["理论可放电情况"], m["综合充放电数值"], m["综合充放电文本"]
+        ]
+        monthly_rows.append(row)
+
+    config_headers1 = [
+        "变压器容量(kVA)", "安全系数", "功率上限(kW)", "基本电费", "需量数据选择", "充放模式",
+        "设备型号", "台数", "系统功率(kW)", "系统额定电量(kWh)", "夏冬尖峰前峰放电倍率",
+        "夏冬尖峰后峰放电倍率", "放电保护", "设备规格(功率)", "设备规格(标定容量)", "设备规格(实际容量)"
+    ]
+    config_row1 = [
+        transformer_capacity,
+        safety_factor,
+        power_limit,
+        "按容",
+        "电费清单",
+        charge_mode,
+        device_model,
+        unit_count,
+        total_power,
+        total_rated,
+        1.0,
+        1.0,
+        total_power * 0.1,
+        power_per_unit,
+        rated_per_unit,
+        actual_per_unit
+    ]
+    config_headers2 = [
+        "临界容量", "需量保护值", "DOD", "年衰减率", "日衰减率", "商务模式",
+        "折扣", "居间", "含税充电电价(元/kWh)", "含税放电电价(元/kWh)",
+        "系统实际电量(kWh)", "上午天数折算系数", "上午限制放电量",
+        "下午限制放电量", "14-15点平段充电倍率", "0.5C有效天数", "2充放回收期间接法"
+    ]
+    payback_headers, payback_data = generate_payback_table_data(
+        total_eq_days, discharge_tax, charge_tax, total_rated, total_actual, unit_count,
+        device_cost, construction_cost, discount_rate, brokerage_rate,
+        system_efficiency_payback, operation_cost_rate, tax_rate, interest_rate,
+        per_unit=per_unit
+    )
+    payback_text = payback_data[-2][-1] if payback_data else ""
+    config_row2 = [
+        transformer_capacity * 0.625,
+        178.45,
+        "100%",
+        f"{annual_decay_rate*100:.2f}%",
+        f"{annual_decay_rate/365*100:.3f}%",
+        "EMC",
+        discount_rate,
+        brokerage_rate,
+        round(charge_tax, 4),
+        round(discharge_tax, 4),
+        total_actual,
+        "100%",
+        f"{morning_limit_ratio*100}%",
+        f"{afternoon_limit_ratio*100}%",
+        "0%",
+        round(total_eq_days, 2),
+        payback_text
+    ]
+    csv_buffer = StringIO()
+    writer = csv.writer(csv_buffer, quoting=csv.QUOTE_MINIMAL)
+    writer.writerow(monthly_headers)
+    writer.writerows(monthly_rows)
+    writer.writerow([])
+    writer.writerow(config_headers1)
+    writer.writerow(config_row1)
+    writer.writerow(config_headers2)
+    writer.writerow(config_row2)
+    storage_config_csv = csv_buffer.getvalue()
+    storage_config_base64 = base64.b64encode(storage_config_csv.encode('utf-8')).decode('utf-8')
+
+    # 回收期表CSV
+    payback_csv_buffer = StringIO()
+    writer_pb = csv.writer(payback_csv_buffer, quoting=csv.QUOTE_MINIMAL)
+    writer_pb.writerow(payback_headers)
+    writer_pb.writerows(payback_data)
+    payback_csv = payback_csv_buffer.getvalue()
+    payback_base64 = base64.b64encode(payback_csv.encode('utf-8')).decode('utf-8')
+
+    # 2充放收益测算表
+    profit_csv = generate_profit_calculation_data(
+        total_eq_days, discharge_tax, charge_tax, total_rated, total_actual, unit_count,
+        device_cost, construction_cost, discount_rate,
+        system_efficiency_payback, operation_cost_rate, tax_rate, interest_rate,
+        per_unit=per_unit
+    )
+    profit_calculation_base64 = base64.b64encode(profit_csv.encode('utf-8')).decode('utf-8')
+
+    return {
+        "error": "",
+        "pivot_base64": pivot_base64,
+        "power_matrix_base64": power_matrix_base64,
+        "stats_base64": stats_base64,
+        "storage_config_base64": storage_config_base64,
+        "payback_base64": payback_base64,
+        "profit_calculation_base64": profit_calculation_base64
+    }se64 = base64.b64encode(profit_csv.encode('utf-8')).decode('utf-8')
+
+    # ========== 7. 返回结果 ==========
+    return {
+        "error": "",
+        "pivot_base64": pivot_base64,
+        "power_matrix_base64": power_matrix_base64,
+        "stats_base64": stats_base64,
+        "storage_config_base64": storage_config_base64,
+        "payback_base64": payback_base64,
+        "profit_calculation_base64": profit_calculation_base64
+    }
