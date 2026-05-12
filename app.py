@@ -159,7 +159,7 @@ b.metric("静态回收期", f"{selected_result.payback_years:.2f} 年" if select
 c.metric("放电均价", f"{selected_result.discharge_price:.4f}")
 d.metric("充电均价", f"{selected_result.charge_price:.4f}")
 
-tab_monthly, tab_cash = st.tabs(["月度充放电", "现金流"])
+tab_monthly, tab_cash, tab_payback = st.tabs(["月度充放电", "现金流", "回收期明细表"])
 with tab_monthly:
     monthly = detail["monthly"].copy()
     for col in monthly.select_dtypes(include="number").columns:
@@ -179,3 +179,39 @@ with tab_cash:
     )
     st.line_chart(cash_df.set_index("年份")[["间接法累计现金流(万元)"]])
     st.dataframe(cash_df.round(3), use_container_width=True, hide_index=True)
+
+with tab_payback:
+    payback_table = detail["payback"]["payback_table"].copy()
+    payback = detail["payback"]
+    audit_df = pd.DataFrame(
+        {
+            "字段": [
+                "折算运行天数",
+                "回收期系统效率",
+                "充放模式",
+                "第1年电池容量系数",
+                "第1年充电量(万度)",
+                "第1年放电量(万度)",
+                "放电均价(元/kWh)",
+                "充电均价(元/kWh)",
+                "折扣",
+                "第1年电费收入(万元)",
+            ],
+            "数值": [
+                selected_result.run_days,
+                efficiency,
+                selected_result.mode,
+                payback["battery_ratio"][1],
+                payback["charge_kwh_10k"][1],
+                payback["discharge_kwh_10k"][1],
+                selected_result.discharge_price,
+                selected_result.charge_price,
+                discount_rate,
+                payback["cash_in_wan"][1],
+            ],
+        }
+    )
+    audit_df["数值"] = audit_df["数值"].apply(lambda value: round(value, 6) if isinstance(value, float) else value)
+    st.dataframe(audit_df, use_container_width=True, hide_index=True)
+    payback_table = payback_table.map(lambda value: round(value, 4) if isinstance(value, float) else value)
+    st.dataframe(payback_table, use_container_width=True, hide_index=True)

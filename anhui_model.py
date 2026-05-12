@@ -14,6 +14,47 @@ PRICE_HIGH = 1.0915
 PRICE_FLAT = 0.6499
 PRICE_LOW = 0.3128
 
+BATTERY_RATIOS_BY_MODE = {
+    1: [
+        0.0,
+        0.969299294671417,
+        0.922118402184221,
+        0.892376974402727,
+        0.867145848671401,
+        0.844843719695814,
+        0.824999922362021,
+        0.806251880135724,
+        0.78866498842066,
+        0.969299294671417,
+        0.922118402184221,
+        0.892376974402727,
+        0.867145848671401,
+        0.844843719695814,
+        0.824999922362021,
+        0.806251880135724,
+        0.78866498842066,
+    ],
+    2: [
+        0.0,
+        0.96508443228735,
+        0.911341951478372,
+        0.877307270579312,
+        0.848340721203993,
+        0.822686149579489,
+        0.799826112344998,
+        0.778204067906047,
+        0.757902914211625,
+        0.96508443228735,
+        0.911341951478372,
+        0.877307270579312,
+        0.848340721203993,
+        0.822686149579489,
+        0.799826112344998,
+        0.778204067906047,
+        0.757902914211625,
+    ],
+}
+
 
 @dataclass(frozen=True)
 class DeviceSpec:
@@ -412,6 +453,8 @@ def aggregate_monthly(daily_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
     total = {key: sum(safe_float(row.get(key)) for row in rows) for key in total_keys}
     total_charge = total["总充电量(度)"]
     total_discharge = total["总放电量(度)"]
+    total_charge_condition = sum(safe_float(row.get("理论可充电情况")) for row in rows) / 12
+    total_discharge_condition = sum(safe_float(row.get("理论可放电情况")) for row in rows) / 12
     rows.append(
         {
             "月份": "总计",
@@ -423,9 +466,9 @@ def aggregate_monthly(daily_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "峰放电占比": total["峰放电量(度)"] / total_discharge if total_discharge else 0.0,
             "平放电占比": total["平放电量(度)"] / total_discharge if total_discharge else 0.0,
             "每月天数": 365,
-            "理论可充电情况": 0.0,
-            "理论可放电情况": 0.0,
-            "综合充放电数值": 0.0,
+            "理论可充电情况": total_charge_condition,
+            "理论可放电情况": total_discharge_condition,
+            "综合充放电数值": min(total_charge_condition, total_discharge_condition),
             "综合充放电文本": "",
         }
     )
@@ -677,22 +720,24 @@ def payback_summary(
     total_rated: float,
     total_actual: float,
     unit_count: int,
+    charge_mode: int,
     device_cost: float,
     construction_cost: float,
     params: ModelParams,
 ) -> dict[str, Any]:
     total_device_cost = device_cost * unit_count
     total_construction_cost = construction_cost * unit_count
-    invest_yr9 = round(0.4 * total_rated / 10 / 1.13, 4)
-    brokerage_yr0 = round(total_rated * params.brokerage_rate / 10, 4)
+    invest_yr9 = 0.4 * total_rated / 10 / 1.13
+    brokerage_yr0 = total_rated * params.brokerage_rate / 10
     invest_tax_yr1 = total_device_cost + total_construction_cost + brokerage_yr0
     invest_no_tax_yr1 = total_device_cost / 1.13 + total_construction_cost + brokerage_yr0
-    input_tax = round(invest_tax_yr1 - invest_no_tax_yr1, 4)
-    battery_ratio = [0.0, 0.965, 0.911, 0.877, 0.848, 0.823, 0.800, 0.778, 0.758, 0.965, 0.911, 0.877, 0.848, 0.823, 0.800, 0.778, 0.758]
+    input_tax = invest_tax_yr1 - invest_no_tax_yr1
+    battery_ratio = BATTERY_RATIOS_BY_MODE.get(charge_mode, BATTERY_RATIOS_BY_MODE[2])
+    cycle_multiplier = 2 if charge_mode == 2 else 1
 
     power_station_invest = [0.0] * 17
     power_station_invest[0] = total_device_cost
-    power_station_invest[8] = round(invest_yr9 * 1.13, 4)
+    power_station_invest[8] = invest_yr9 * 1.13
     construction_invest = [0.0] * 17
     construction_invest[0] = total_construction_cost
     brokerage = [0.0] * 17
@@ -702,17 +747,17 @@ def payback_summary(
     discharge_kwh = [0.0] * 17
     cash_in = [0.0] * 17
     for n in range(1, 17):
-        charge_kwh[n] = round((run_days * total_actual) * 2 / 10000 / (1 - (1 - params.system_efficiency_payback) / 2) * battery_ratio[n], 2)
-        discharge_kwh[n] = round(params.system_efficiency_payback * charge_kwh[n], 2)
-        cash_in[n] = round((discharge_kwh[n] * discharge_tax - charge_kwh[n] * charge_tax) * params.discount_rate, 2)
+        charge_kwh[n] = (run_days * total_actual) * cycle_multiplier / 10000 / (1 - (1 - params.system_efficiency_payback) / 2) * battery_ratio[n]
+        discharge_kwh[n] = params.system_efficiency_payback * charge_kwh[n]
+        cash_in[n] = (discharge_kwh[n] * discharge_tax - charge_kwh[n] * charge_tax) * params.discount_rate
 
     operation_cost = [0.0] * 17
     insurance_cost = [0.0] * 17
     output_tax = [0.0] * 17
     for n in range(1, 17):
-        operation_cost[n] = round(params.operation_cost_rate * 20 * unit_count, 2)
-        insurance_cost[n] = round(invest_no_tax_yr1 * 0.0015, 4)
-        output_tax[n] = round(cash_in[n] - cash_in[n] / 1.13, 4)
+        operation_cost[n] = params.operation_cost_rate * 20 * unit_count
+        insurance_cost[n] = invest_no_tax_yr1 * 0.0015
+        output_tax[n] = cash_in[n] - cash_in[n] / 1.13
 
     vat_tax = [0.0] * 17
     vat_tax[0] = -input_tax
@@ -723,16 +768,16 @@ def payback_summary(
         sum_vat = sum(vat_tax[: n + 1])
         paid_before = sum(pay_vat[:n])
         if sum_vat > 0 and paid_before == 0:
-            pay_vat[n] = round(sum_vat, 4)
+            pay_vat[n] = sum_vat
         elif sum_vat > 0 and paid_before > 0:
-            pay_vat[n] = round(vat_tax[n], 4)
+            pay_vat[n] = vat_tax[n]
 
     tax_surcharge = [0.0] * 17
     depreciation = [0.0] * 17
-    depr_yr1_8 = round(invest_no_tax_yr1 * 0.95 / 8, 4)
-    depr_yr9_16 = round(power_station_invest[8] * 0.95 / (1.13 * 8), 4)
+    depr_yr1_8 = invest_no_tax_yr1 * 0.95 / 8
+    depr_yr9_16 = power_station_invest[8] * 0.95 / (1.13 * 8)
     for n in range(1, 17):
-        tax_surcharge[n] = round(cash_in[n] * 3 / 10000 + pay_vat[n] * 0.12, 4)
+        tax_surcharge[n] = cash_in[n] * 3 / 10000 + pay_vat[n] * 0.12
         depreciation[n] = depr_yr1_8 if n <= 8 else depr_yr9_16
 
     cash_out = [0.0] * 17
@@ -741,22 +786,24 @@ def payback_summary(
     interest = [0.0] * 17
     income_tax = [0.0] * 17
     project_pre_tax_profit = [0.0] * 17
+    judge_vat = [0.0] * 17
     indirect_cum_cash_flow = [0.0] * 17
 
-    cash_out[0] = round(total_device_cost + total_construction_cost + brokerage[0], 4)
+    cash_out[0] = total_device_cost + total_construction_cost + brokerage[0]
     net_cash_flow[0] = -cash_out[0]
     cum_cash_flow[0] = net_cash_flow[0]
-    indirect_cum_cash_flow[0] = cum_cash_flow[0]
+    indirect_cum_cash_flow[0] = -invest_no_tax_yr1 + vat_tax[0]
 
     for n in range(1, 17):
-        interest[n] = round(abs(cum_cash_flow[n - 1]) * params.interest_rate, 4) if cum_cash_flow[n - 1] < 0 else 0.0
+        interest[n] = abs(cum_cash_flow[n - 1]) * params.interest_rate if cum_cash_flow[n - 1] < 0 else 0.0
         taxable_base = cash_in[n] - operation_cost[n] - insurance_cost[n] - tax_surcharge[n] - interest[n] - depreciation[n] - output_tax[n]
-        income_tax[n] = round(taxable_base * params.tax_rate, 4)
-        cash_out[n] = round(power_station_invest[n] + brokerage[n] + operation_cost[n] + insurance_cost[n] + tax_surcharge[n] + interest[n] + income_tax[n] + pay_vat[n], 4)
-        net_cash_flow[n] = round(cash_in[n] - cash_out[n], 4)
-        cum_cash_flow[n] = round(cum_cash_flow[n - 1] + net_cash_flow[n], 4)
+        income_tax[n] = taxable_base * params.tax_rate
+        cash_out[n] = power_station_invest[n] + brokerage[n] + operation_cost[n] + insurance_cost[n] + tax_surcharge[n] + interest[n] + income_tax[n] + pay_vat[n]
+        net_cash_flow[n] = cash_in[n] - cash_out[n]
+        cum_cash_flow[n] = cum_cash_flow[n - 1] + net_cash_flow[n]
         project_pre_tax_profit[n] = round(taxable_base, 2)
-        indirect_cum_cash_flow[n] = round(depreciation[n] + project_pre_tax_profit[n] + indirect_cum_cash_flow[n - 1] + output_tax[n] - tax_surcharge[n] - max(pay_vat[n], 0.0), 4)
+        judge_vat[n] = pay_vat[n] if pay_vat[n] > 0 else 0.0
+        indirect_cum_cash_flow[n] = project_pre_tax_profit[n] - income_tax[n] + depreciation[n] + indirect_cum_cash_flow[n - 1] + output_tax[n] - judge_vat[n]
 
     payback = None
     for idx, value in enumerate(indirect_cum_cash_flow):
@@ -769,15 +816,61 @@ def payback_summary(
                 payback = round((idx - 1) + abs(prev) / denom, 2) if denom else float(idx)
             break
 
+    payback_yearly: list[str] = []
+    for idx, value in enumerate(indirect_cum_cash_flow):
+        if payback is None:
+            payback_yearly.append("未回收")
+        elif value >= 0:
+            payback_yearly.append(f"{payback:.2f}年（已回收）")
+        elif idx < 16:
+            next_value = indirect_cum_cash_flow[idx + 1]
+            denom = next_value - value
+            payback_yearly.append(f"{abs(value) / denom:.2f}年（预测）" if denom else "未回收")
+        else:
+            payback_yearly.append("未回收")
+
+    columns = ["项目", *[f"第{n}年" for n in range(17)], "合计"]
+    table_rows = [
+        ["电池容量", *[f"{value * 100:.6f}%" if value else "0.000000%" for value in battery_ratio], "-"],
+        ["充电量（万度）", *charge_kwh, round(sum(charge_kwh), 4)],
+        ["放电量（万度）", *discharge_kwh, round(sum(discharge_kwh), 4)],
+        ["现金流入（电费收入）", *cash_in, round(sum(cash_in), 4)],
+        ["电费收入", *cash_in, round(sum(cash_in), 4)],
+        ["现金流出", *cash_out, round(sum(cash_out), 4)],
+        ["电站投资", *power_station_invest, round(sum(power_station_invest), 4)],
+        ["施工", *construction_invest, round(sum(construction_invest), 4)],
+        ["居间", *brokerage, round(sum(brokerage), 4)],
+        ["运营成本", *operation_cost, round(sum(operation_cost), 4)],
+        ["保险费用", *insurance_cost, round(sum(insurance_cost), 4)],
+        ["税金及附加", *tax_surcharge, round(sum(tax_surcharge), 4)],
+        ["利息", *interest, round(sum(interest), 4)],
+        ["税费（所得税，非绝对值）", *income_tax, round(sum(income_tax), 4)],
+        ["支付增值税", *pay_vat, round(sum(pay_vat), 4)],
+        ["现金净流入", *net_cash_flow, round(sum(net_cash_flow), 4)],
+        ["累计现金流量", *cum_cash_flow, round(cum_cash_flow[-1], 4)],
+        ["项目折旧", *depreciation, round(sum(depreciation), 4)],
+        ["增值税", *vat_tax, round(sum(vat_tax), 4)],
+        ["销项税", *output_tax, round(sum(output_tax), 4)],
+        ["项目税前利润", *project_pre_tax_profit, round(sum(project_pre_tax_profit), 2)],
+        ["判断", *judge_vat, round(sum(judge_vat), 4)],
+        ["间接法累计现金流", *indirect_cum_cash_flow, round(indirect_cum_cash_flow[-1], 4)],
+        ["静态投资回收期", *payback_yearly, f"{payback:.2f}年（已回收）" if payback is not None else "全周期无法回收投资"],
+    ]
+
     return {
         "payback_years": payback,
         "first_year_income_wan": cash_in[1],
         "initial_invest_wan": cash_out[0],
         "final_cash_flow_wan": indirect_cum_cash_flow[-1],
+        "battery_ratio": battery_ratio,
         "charge_kwh_10k": charge_kwh,
         "discharge_kwh_10k": discharge_kwh,
         "cash_in_wan": cash_in,
+        "cash_out_wan": cash_out,
+        "net_cash_flow_wan": net_cash_flow,
+        "cum_cash_flow_wan": cum_cash_flow,
         "indirect_cum_cash_flow_wan": indirect_cum_cash_flow,
+        "payback_table": pd.DataFrame(table_rows, columns=columns),
     }
 
 
@@ -812,6 +905,7 @@ def evaluate_config(pivot_df: pd.DataFrame, spec: DeviceSpec, unit_count: int, p
         total_rated,
         total_actual,
         unit_count,
+        spec.mode,
         spec.device_cost_wan,
         spec.construction_cost_wan,
         params,
